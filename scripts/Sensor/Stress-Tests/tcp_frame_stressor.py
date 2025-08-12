@@ -14,6 +14,7 @@ Uso rapido:
 import argparse, os, socket, time, random, struct
 import sys, math, binascii, traceback
 from typing import List, Tuple, Optional
+
 try:
     from crc32_ieee import crc32_compute  # tabella/algoritmo come su board
 except Exception:
@@ -80,43 +81,49 @@ def send_all(s: socket.socket, data: bytes, *, split: int = 1, garbage: int = 0)
             vj = vj[n:]
 
 
-
-def build_header(nreports: int, header_only: bool, stalta: int, fft: int,
-                 chmax: int, nChannels: int, tfft_us: int = None,
-                 metrics: bytes | None = None) -> bytes:
+def build_header(nreports: int,
+                 header_only: bool = False,
+                 stalta: int = 0,
+                 fft: int = 0,
+                 chmax: int = 0,
+                 nChannels: int = 1,
+                 tstamp_ms: int = None,
+                 metrics: Optional[List[float]] = None,
+                 datafmt: int = 0,
+                 header_crc: bool = False) -> bytes:
     """
-    Crea un header di 40 byte:
-    - 36B 'core' (2 sync, 2 preamble, 8 tFFT, 6*4B metrics)
-    - +4B CRC32 (IEEE, little-endian) calcolato sui 36B di core.
+    Header base = 36B:
+      0..1  : sync A5 5A
+      2     : pre1 => [fft(1) | stalta(1) | datafmt(2, 0) | nreports(4)]
+      3     : pre2 => [chmax(2) | nch(1) | headerOnly(1) | reserved(4)]
+      4..11 : tstamp_fft_ms (uint64 LE)
+      12..35: 6 * float32 metrics
+
+    Se header_crc=True, appende 4 byte (uint32 LE) con CRC-32/IEEE calcolato sui primi 36B.
     """
-    # 2B sync
-    sync = b'\xA5\x5A'  # o alterna con 5A A5 se vuoi
+    pre1 = ((1 if fft else 0) << 7) | ((1 if stalta else 0) << 6) | ((datafmt & 0x3) << 4) | (nreports & 0xF)
+    pre2 = ((chmax & 0x3)) | ((1 if nChannels else 0) << 2) | ((1 if header_only else 0) << 3)
+    sync = b'\xA5\x5A'
 
-    # 2B preamble
-    pre1 = ((fft & 1) << 7) | ((stalta & 1) << 6) | ((0 & 0b11) << 4) | (nreports & 0x0F)
-    pre2 = ((nChannels & 0x01) << 2) | ((1 if header_only else 0) << 3) | (chmax & 0x03)
-    preamble = bytes((pre1, pre2))
+    if tstamp_ms is None:
+        tstamp_ms = int(time.time() * 1000)
+    ts8 = struct.pack('<Q', int(tstamp_ms))
 
-    # 8B FFT timestamp (uint64 little). Se non passato, usa epoch µs attuale
-    if tfft_us is None:
-        tfft_us = int(time.time() * 1_000_000)
-    tfft_le = int(tfft_us).to_bytes(8, 'little', signed=False)
-
-    # 6*4B metrics (se non passati, metti 24 byte a zero)
     if metrics is None:
-        metrics = bytes(24)
-    elif len(metrics) != 24:
-        raise ValueError("metrics must be 24 bytes")
+        metrics = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    mbytes = b''.join(struct.pack('<f', float(x)) for x in metrics[:6])
 
-    core36 = sync + preamble + tfft_le + metrics
-    if len(core36) != 36:
-        raise AssertionError("header core must be 36 bytes")
+    head36 = sync + bytes([pre1, pre2]) + ts8 + mbytes
+    assert len(head36) == 36
 
-    # CRC32 sui primi 36 byte
-    crc = crc32_compute(core36)
-    crc_le = crc.to_bytes(4, 'little', signed=False)
-
-    return core36 + crc_le  # 40 byte totali
+    if header_crc:
+        # CRC-32 IEEE 802.3 (reflected) – stesso risultato di zlib.crc32
+        crc = zlib.crc32(head36) & 0xFFFFFFFF
+        head = head36 + struct.pack('<I', crc)
+        assert len(head) == 40
+        return head
+    else:
+        return head36
 
 
 def build_report(delta_ts:int, vals8:List[float], filt3:List[float]) -> bytes:
@@ -128,6 +135,23 @@ def build_report(delta_ts:int, vals8:List[float], filt3:List[float]) -> bytes:
     body += b''.join(struct.pack('<f', float(v)) for v in filt3)
     assert len(ts) + len(body) == REPORT_LEN
     return ts + body
+
+def build_report_epoch(ts_epoch_us: int, accel: List[float] = None, filt: List[float] = None) -> bytes:
+    """
+    Wrapper: identico a build_report() ma il primo campo è un timestamp UNIX epoch in microsecondi.
+    """
+    vals8 = accel if accel is not None else [0.0]*8
+    filt3 = filt  if filt  is not None else [0.0]*3
+    return build_report(ts_epoch_us, vals8, filt3)
+
+def build_report_delta(delta_us: int, accel: List[float] = None, filt: List[float] = None) -> bytes:
+    """
+    Wrapper: identico a build_report(), il primo campo è un delta in microsecondi dal primo campione.
+    """
+    vals8 = accel if accel is not None else [0.0]*8
+    filt3 = filt  if filt  is not None else [0.0]*3
+    return build_report(delta_us, vals8, filt3)
+
 
 def one_frame(nreports:int, start_ts:int, ts_step_ms:float,
               microseconds:bool=False) -> Tuple[bytes,int]:

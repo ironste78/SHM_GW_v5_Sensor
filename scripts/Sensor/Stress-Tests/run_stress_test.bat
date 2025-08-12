@@ -27,6 +27,12 @@ set "JSON=.\work\stress_report.json"
 set "WAIT=20"
 REM ----------------------------------------------------------
 
+REM --- provenance (metti i tuoi valori reali) ---
+set REPO_URL=https://github.com/ironste78/SHM_GW_v5_Sensor.git
+set COMMIT_SHA=e2024b0db796f42c3c7b20d55836d375aacf17a3
+set BRANCH=main
+set DIRTY=0
+
 REM Gather scenarios from args; default to "all"
 set "TEST_SCENARIOS=%*"
 if not defined TEST_SCENARIOS set "TEST_SCENARIOS=all"

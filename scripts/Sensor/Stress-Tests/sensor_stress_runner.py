@@ -27,6 +27,9 @@ Oppure (solo alcuni scenari):
 import argparse, os, sys, subprocess, time, shutil, uuid, re, signal, json, html
 import shlex
 from typing import Any, Dict, List, Optional
+from datetime import datetime, timezone
+from html import escape
+
 
 HERE = os.path.abspath(os.path.dirname(__file__))
 DEFAULT_WORK_ROOT = os.path.join(HERE, "work")
@@ -337,109 +340,227 @@ def find_sensor_log(log_dir: str) -> Optional[str]:
 def ensure_dir(p: str):
     os.makedirs(p, exist_ok=True)
 
-def html_report(path: str, results: List[Dict[str, Any]]):
-    ensure_dir(os.path.dirname(path))
-    # CSS minimale con pallini verdi/rossi
-    css = """
-    body { font-family: Segoe UI, Roboto, Arial, sans-serif; margin: 24px; }
-    h1 { margin-top: 0; }
-    table { border-collapse: collapse; width: 100%; }
-    th, td { padding: 8px 10px; border-bottom: 1px solid #eee; vertical-align: top; }
-    .status { font-weight: 600; }
-    .PASS { color: #0a8a0a; }
-    .FAIL { color: #b30000; }
-    .ERROR { color: #b36b00; }
-    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }
-    .dot.pass { background: #15c215; }
-    .dot.fail { background: #e01616; }
-    .dot.err { background: #f3a400; }
-    details { margin-top: 6px; }
-    code { background: #f7f7f7; padding: 1px 4px; border-radius: 3px; }
-    .stderr-tail { max-width: 520px; max-height: 8em; overflow: auto; font-size: 12px; background: #222; color: #fafafa; padding: 6px 8px; border-radius: 6px; }
-    .small { color: #666; font-size: 12px; }
+def html_report(out_path: str, final_report: dict) -> None:
     """
-    # body
-    passed = sum(1 for r in results if r["status"] == "PASS")
-    failed = sum(1 for r in results if r["status"] == "FAIL")
-    errored = sum(1 for r in results if r["status"] == "ERROR")
+    Renderizza un report HTML a partire dal dizionario 'final_report' che contiene:
+      - collected_at_utc: str
+      - repo_url, commit_sha, commit_short, branch, dirty
+      - summary: {pass, fail, error, total}
+      - results: [ {scenario, name, uuid, status, log, checks:[...], reason?, mock_error_tail?, stressor_error_tail?, ...}, ... ]
+    """
+    def _fmt_bool(b):
+        return "yes" if b else "no"
+
+    def _status_class(s):
+        s = (s or "").upper()
+        return {"PASS": "ok", "FAIL": "fail", "ERROR": "error"}.get(s, "unknown")
+
+    def _linkify(path):
+        if not path:
+            return ""
+        # se è un path esistente, rende un link file://, altrimenti testo plain
+        href = path
+        return f'<a href="file:///{escape(href.replace("\\\\", "/"))}" title="{escape(path)}">{escape(os.path.basename(path))}</a>'
+
+    meta = final_report or {}
+    results = meta.get("results", [])
+    summary = meta.get("summary", {})
+    collected_at = meta.get("collected_at_utc", "")
+    repo_url = meta.get("repo_url", "")
+    commit_sha = meta.get("commit_sha", "")
+    commit_short = meta.get("commit_short", "")
+    branch = meta.get("branch", "")
+    dirty = bool(meta.get("dirty", False))
+
+    # link commit se repo_url è GitHub-like
+    if repo_url and commit_sha and ("github.com" in repo_url.lower()):
+        commit_html = f'<a href="{escape(repo_url)}/commit/{escape(commit_sha)}" target="_blank">{escape(commit_short or commit_sha[:12])}</a>'
+    else:
+        commit_html = escape(commit_short or (commit_sha[:12] if commit_sha else ""))
+
     rows = []
     for r in results:
-        dot_class = "pass" if r["status"] == "PASS" else ("fail" if r["status"] == "FAIL" else "err")
-        log_link = html.escape(r.get("log",""))
-        checks_html = ""
-        for c in r.get("checks", []):
-            patt = c.get("pattern", c.get("re",""))
-            matched = c.get("matched", False)
-            count = c.get("count", None)
-            minv = c.get("min", None)
-            maxv = c.get("max", None)
-            line = f"<code>{html.escape(patt)}</code> → "
-            if count is not None:
-                line += f"count={count} "
-            line += ("✅" if matched else "❌")
-            if minv is not None: line += f" (min={minv})"
-            if maxv is not None: line += f" (max={maxv})"
-            checks_html += f"<div class='small'>{line}</div>"
-        tail = r.get("stressor_error_tail") or r.get("mock_error_tail") or r.get("diagnostic") or ""
-        html_tail = f'<pre class="stderr-tail">{tail}</pre>' if tail else ""
-        reason = html.escape(r.get("reason",""))        
+        scen   = r.get("scenario", "")
+        name   = r.get("name", "")
+        uuid   = r.get("uuid", "")
+        status = r.get("status", "")
+        logp   = r.get("log", "")
+        reason = r.get("reason", "")
+        st_tail = r.get("stressor_error_tail", "")
+        mk_tail = r.get("mock_error_tail", "")
+        checks = r.get("checks", []) or []
+
+        # dettagli
+        details_lines = []
+        if reason:
+            details_lines.append(f'<div class="reason"><b>Reason:</b> {escape(reason)}</div>')
+
+        # tail (stderr)
+        if st_tail:
+            details_lines.append('<div class="tail"><b>Stressor stderr (tail):</b><pre>' + escape(st_tail) + '</pre></div>')
+        if mk_tail:
+            details_lines.append('<div class="tail"><b>Mock stderr (tail):</b><pre>' + escape(mk_tail) + '</pre></div>')
+
+        # comandi (se salvati nel risultato)
+        if r.get("sensor_cmd"):
+            details_lines.append(f'<div class="cmd"><b>Sensor cmd:</b> <code>{escape(r["sensor_cmd"])}</code></div>')
+        if r.get("mock_cmd"):
+            details_lines.append(f'<div class="cmd"><b>Mock cmd:</b> <code>{escape(r["mock_cmd"])}</code></div>')
+        if r.get("stressor_cmd"):
+            details_lines.append(f'<div class="cmd"><b>Stressor cmd:</b> <code>{escape(r["stressor_cmd"])}</code></div>')
+
+        # args stressor (se presenti)
+        if isinstance(r.get("stressor_args"), dict):
+            details_lines.append('<div class="args"><b>Stressor args:</b> <pre>' +
+                                 escape(json.dumps(r["stressor_args"], indent=2)) + '</pre></div>')
+
+        # checks
+        if checks:
+            ch_html = ['<div class="checks"><b>Checks:</b><ul>']
+            for c in checks:
+                pat = c.get("pattern", "")
+                cnt = c.get("count", 0)
+                matched = c.get("matched", None)
+                minv = c.get("min", None)
+                maxv = c.get("max", None)
+                cls = ""
+                if matched is False:
+                    cls = ' class="bad"'
+                ch_html.append(f'<li{cls}><code>{escape(pat)}</code> → count={cnt}'
+                               + (f", min={minv}" if minv is not None else "")
+                               + (f", max={maxv}" if maxv is not None else "")
+                               + (", matched=✗" if matched is False else (", matched=✓" if matched is True else ""))
+                               + '</li>')
+            ch_html.append("</ul></div>")
+            details_lines.append("".join(ch_html))
+
+        # link al log
+        log_html = _linkify(logp)
+
         rows.append(f"""
-          <tr>
-            <td>{html.escape(r['scenario'])}</td>
-            <td class="status {r['status']}"><span class="dot {dot_class}"></span>{r['status']}</td>
-            <td>{html.escape(r.get('name',''))}<details><summary>Dettagli</summary>
-                <div class="small">UUID: <code>{html.escape(r.get('uuid',''))}</code></div>
-                <div class="small">Reason: {reason}</div>
-                <div class="small">Log: <code>{log_link}</code></div>
-                {checks_html}
-            </details></td>
-            <td>{html_tail}</td>
-          </tr>
+        <tr class="{_status_class(status)}">
+          <td class="scenario">{escape(str(scen))}</td>
+          <td class="name">{escape(name)}</td>
+          <td class="uuid">{escape(uuid)}</td>
+          <td class="status">{escape(status)}</td>
+          <td class="log">{log_html}</td>
+          <td class="details">{''.join(details_lines) or ''}</td>
+        </tr>
         """)
-    body = f"""
-    <html><head><meta charset="utf-8"><title>Sensor Stress Report</title>
-    <style>{css}</style></head><body>
-    <h1>Sensor Stress Report</h1>
-    <div>Summary: <b>{passed} PASS</b> · <b>{failed} FAIL</b> · <b>{errored} ERROR</b> / {len(results)}</div>
-    <table>
-      <thead><tr><th>Scenario</th><th>Esito</th><th>Dettagli</th><th>stderr tail</th></tr></thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
-    </table>
-    </body></html>
-    """
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(body)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Sensor Stress Report</title>
+<style>
+body {{ font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 20px; }}
+h1 {{ margin: 0 0 8px 0; }}
+.meta {{ margin: 8px 0 16px 0; font-size: 14px; color: #333; }}
+.meta code {{ background:#f6f8fa; padding:2px 4px; border-radius:4px; }}
+.summary {{ margin: 12px 0 16px 0; padding: 8px; background:#f6f8fa; border:1px solid #e1e4e8; border-radius:6px; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }}
+th {{ background: #fafafa; text-align: left; }}
+tr.ok td.status {{ color: #0b7a0b; font-weight: 700; }}
+tr.fail td.status {{ color: #ad2c24; font-weight: 700; }}
+tr.error td.status {{ color: #9f36c2; font-weight: 700; }}
+tr.unknown td.status {{ color: #666; font-weight: 700; }}
+td.details .tail pre, td.details .args pre {{ background:#f6f8fa; border:1px solid #e1e4e8; border-radius:6px; padding:8px; white-space: pre-wrap; }}
+td.details .checks ul {{ margin:6px 0 0 18px; }}
+td.details .checks li.bad {{ color:#ad2c24; font-weight:600; }}
+.small {{ font-size: 12px; color:#555; }}
+.footer {{ margin-top: 22px; font-size: 12px; color:#666; }}
+</style>
+</head>
+<body>
+  <h1>Sensor Stress Report</h1>
+  <div class="meta">
+    <div><b>Collected at (UTC):</b> {escape(collected_at)}</div>
+    <div><b>Repo:</b> {('<a href="' + escape(repo_url) + '" target="_blank">' + escape(repo_url) + '</a>') if repo_url else '-'}</div>
+    <div><b>Commit:</b> {commit_html or '-'} &nbsp; <span class="small">(full: {escape(commit_sha) if commit_sha else '-'})</span></div>
+    <div><b>Branch:</b> {escape(branch) if branch else '-'} &nbsp;&nbsp; <b>Dirty:</b> {_fmt_bool(dirty)}</div>
+  </div>
+
+  <div class="summary">
+    <b>Summary:</b> PASS={summary.get('pass', 0)} &nbsp; FAIL={summary.get('fail', 0)} &nbsp; ERROR={summary.get('error', 0)} &nbsp; / {summary.get('total', len(results))}
+  </div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Scenario</th>
+        <th>Name</th>
+        <th>UUID</th>
+        <th>Status</th>
+        <th>Sensor log</th>
+        <th>Details</th>
+      </tr>
+    </thead>
+    <tbody>
+      {''.join(rows) if rows else '<tr><td colspan="6" class="small">No results.</td></tr>'}
+    </tbody>
+  </table>
+
+  <div class="footer">Generated on {escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</div>
+</body>
+</html>
+"""
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
 
 # -------------------- Core --------------------
 def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, Any],
                  cwd_sensor: str, work_root: str, default_duration: float = 12.0, sensor_wait_seconds: float = 0.0,
-                 board_mock_cmd: Optional[str] = None, board_mock_args: Optional[str] = None, stressor_extra="") -> Dict[str, Any]:
+                 board_mock_cmd: Optional[str] = None, board_mock_args: Optional[str] = None, stressor_extra: str = "") -> Dict[str, Any]:
     sensor = stress = mock_proc = None
     sensor_out = sensor_err = mock_out = mock_err = None
-                     
+
     sid = f"{scenario}-{uuid.uuid4().hex[:8]}"
     uuid_str = f"test-{sid}"
     work_dir = os.path.abspath(os.path.join(work_root, f"{sid}"))
     log_dir = os.path.join(work_dir, "logs")
     ensure_dir(log_dir)
 
+    # percorsi log
+    sensor_out_path = os.path.join(work_dir, "sensor_stdout.log")
+    sensor_err_path = os.path.join(work_dir, "sensor_stderr.log")
+    mock_out_path   = os.path.join(work_dir, "mock_stdout.log")
+    mock_err_path   = os.path.join(work_dir, "mock_stderr.log")
+    st_out_path     = os.path.join(work_dir, "stressor_stdout.log")
+    st_err_path     = os.path.join(work_dir, "stressor_stderr.log")
+
+    # metadati repo (se presenti nell’ambiente)
+    provenance = {
+        "repo_url":   os.environ.get("GIT_URL"),
+        "repo_branch":os.environ.get("GIT_BRANCH"),
+        "repo_commit":os.environ.get("GIT_COMMIT"),
+        "runner_sha": os.environ.get("RUNNER_SHA"),
+    }
+
+    # precompilo alcune stringhe che riporteremo nel risultato
+    mock_cmd_effective = None
+    sensor_cmd_effective = None
+    stressor_cmd_printable = None
+
     try:
-        # avvio mock della board (console TCP) se richiesto
+        # --- 1) Avvio mock della board (console TCP) se richiesto
         console_port = parse_console_port(board_mock_args or "")
         if board_mock_cmd:
-            mock_cmd = f'{board_mock_cmd} {(board_mock_args or "").format(uuid=uuid_str)}'
+            mock_cmd_effective = f'{board_mock_cmd} {(board_mock_args or "").format(uuid=uuid_str)}'
             mock_env = os.environ.copy()
-            mock_out_path = os.path.join(work_dir, "mock_stdout.log")
-            mock_err_path = os.path.join(work_dir, "mock_stderr.log")
-            mock_out = open(os.path.join(work_dir, "mock_stdout.log"), "wb")
-            mock_err = open(os.path.join(work_dir, "mock_stderr.log"), "wb")
-            print_step(f"Starting board mock: {mock_cmd}")
-            mock_proc = subprocess.Popen(mock_cmd, cwd=HERE, env=mock_env, shell=True,
-                                         stdout=mock_out, stderr=mock_err,
-                                         creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name=="nt" else 0))
-                                         
+            mock_out = open(mock_out_path, "wb")
+            mock_err = open(mock_err_path, "wb")
+            print_step(f"Starting board mock: {mock_cmd_effective}")
+            creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+            mock_proc = subprocess.Popen(
+                mock_cmd_effective, cwd=HERE, env=mock_env, shell=True,
+                stdout=mock_out, stderr=mock_err,
+                creationflags=creationflags
+            )
+
             print_step(f"Waiting board mock on tcp://127.0.0.1:{console_port} ...")
             if not wait_port("127.0.0.1", console_port, timeout=15.0):
                 tail = _read_tail(mock_err_path, max_lines=10)
@@ -449,103 +570,123 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                     "status": "ERROR",
                     "reason": f"Board mock not listening on {console_port}",
                     "log": mock_out_path,
-                    "mock_error_tail": tail
+                    "mock_error_tail": tail,
+                    "board_mock_cmd": mock_cmd_effective,
+                    "provenance": provenance,
+                    "logs": {
+                        "mock_stdout": mock_out_path,
+                        "mock_stderr": mock_err_path
+                    }
                 }
 
-        # Avvio Sensor
+        # --- 2) Avvio Sensor
         env = os.environ.copy()
         env["LOG_DIR"] = log_dir
         env["RUN_DIR"] = os.path.join(work_dir, "run")
         env["SENSOR_ALLOW_UNREGISTERED"] = "1"
         ensure_dir(env["RUN_DIR"])
 
+        sensor_out = open(sensor_out_path, "wb")
+        sensor_err = open(sensor_err_path, "wb")
 
-        sensor_out_path = os.path.join(work_dir, "sensor_stdout.log")
-        sensor_err_path = os.path.join(work_dir, "sensor_stderr.log")
-        sensor_out = open(os.path.join(work_dir, "sensor_stdout.log"), "wb")
-        sensor_err = open(os.path.join(work_dir, "sensor_stderr.log"), "wb")
-
-        cmd = f'{sensor_cmd} -su {uuid_str} -sp {port} -sh 127.0.0.1'
-        print_step(f"Starting Sensor: (cwd={cwd_sensor}) {cmd}")
-        sensor = subprocess.Popen(cmd, cwd=cwd_sensor, env=env, shell=True,
-                                  stdout=sensor_out, stderr=sensor_err,
-                                  creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name=="nt" else 0))
+        sensor_cmd_effective = f'{sensor_cmd} -su {uuid_str} -sp {port} -sh 127.0.0.1'
+        print_step(f"Starting Sensor: (cwd={cwd_sensor}) {sensor_cmd_effective}")
+        sensor = subprocess.Popen(
+            sensor_cmd_effective, cwd=cwd_sensor, env=env, shell=True,
+            stdout=sensor_out, stderr=sensor_err,
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP if os.name=="nt" else 0)
+        )
 
         # fail-fast se il processo termina subito
         time.sleep(0.8)
         if sensor.poll() is not None:
-            # legge gli ultimi 200k dei file stdout/err per diagnosi
             diag = ""
             try:
                 diag = (tail_file(sensor_out_path) + "\n" + tail_file(sensor_err_path)).strip()
             except Exception:
                 pass
             if mock_proc: kill_proc(mock_proc)
-            return {"scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
-                    "status": "ERROR", "reason": "Sensor exited prematurely", "log": sensor_err_path, "diagnostic": diag}
+            return {
+                "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
+                "status": "ERROR", "reason": "Sensor exited prematurely",
+                "log": sensor_err_path, "diagnostic": diag,
+                "sensor_cmd": sensor_cmd_effective,
+                "provenance": provenance,
+                "logs": {
+                    "sensor_stdout": sensor_out_path,
+                    "sensor_stderr": sensor_err_path,
+                    "mock_stdout": mock_out_path if board_mock_cmd else None,
+                    "mock_stderr": mock_err_path if board_mock_cmd else None
+                }
+            }
 
         print_step("Waiting for 'Socket server opened ...' marker in Sensor log ...")
         if not wait_server_opened(log_dir, port, timeout=30.0):
-            kill_proc(sensor);  kill_proc(mock_proc) if mock_proc else None
-            return {"scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
-                    "status": "ERROR", "reason": "Sensor did not open server (no log marker)",
-                    "log": find_sensor_log(log_dir) or sensor_err_path}
+            kill_proc(sensor)
+            if mock_proc: kill_proc(mock_proc)
+            return {
+                "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
+                "status": "ERROR", "reason": "Sensor did not open server (no log marker)",
+                "log": find_sensor_log(log_dir) or sensor_err_path,
+                "sensor_cmd": sensor_cmd_effective,
+                "provenance": provenance
+            }
         t_open_seen = time.time()
 
         time.sleep(1.2)
-        
+
         print_step(f"Checking tcp://127.0.0.1:{port} reachable ...")
         if not wait_port("127.0.0.1", port, timeout=5.0):
             try:
                 if not wait_port("::1", port, timeout=2.0):
                     raise RuntimeError("no v6 either")
             except Exception:
-                kill_proc(sensor);  kill_proc(mock_proc) if mock_proc else None
-                return {"scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
-                        "status": "ERROR", "reason": "Sensor port not open",
-                        "log": find_sensor_log(log_dir) or sensor_err_path}
+                kill_proc(sensor)
+                if mock_proc: kill_proc(mock_proc)
+                return {
+                    "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
+                    "status": "ERROR", "reason": "Sensor port not open",
+                    "log": find_sensor_log(log_dir) or sensor_err_path,
+                    "sensor_cmd": sensor_cmd_effective,
+                    "provenance": provenance
+                }
 
-        # NEW: attendi che il PacketHandler sia operativo prima di lanciare lo stressor
         print_step("Waiting for '[PacketHandler] Packet handler is running...' marker in Sensor log ...")
         if not wait_packet_handler_started(log_dir, timeout=30.0):
-            kill_proc(sensor);  kill_proc(mock_proc) if mock_proc else None
-            return {"scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
-                    "status": "ERROR", "reason": "Packet handler never started (no log marker)",
-                    "log": find_sensor_log(log_dir) or sensor_err_path}
+            kill_proc(sensor)
+            if mock_proc: kill_proc(mock_proc)
+            return {
+                "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
+                "status": "ERROR", "reason": "Packet handler never started (no log marker)",
+                "log": find_sensor_log(log_dir) or sensor_err_path,
+                "sensor_cmd": sensor_cmd_effective,
+                "provenance": provenance
+            }
 
-
+        # clamp del wait in base a accept-timeout
         if sensor_wait_seconds and sensor_wait_seconds > 0:
             accept_to = int(os.environ.get("SENSOR_ACCEPT_TIMEOUT", "20"))
             elapsed = time.time() - t_open_seen
-            margin  = 5  # secondi di safety
+            margin  = 5
             budget  = max(0, accept_to - margin - elapsed)
-
             eff_wait = min(sensor_wait_seconds, budget)
             print_step(f"Sleeping {eff_wait:.0f}s "
-                  f"(elapsed since server-open={elapsed:.1f}s, "
-                  f"accept-timeout={accept_to}s, margin={margin}s) "
-                  "before launching stressor ...")
+                       f"(elapsed since server-open={elapsed:.1f}s, "
+                       f"accept-timeout={accept_to}s, margin={margin}s) "
+                       "before launching stressor ...")
             time.sleep(eff_wait)
 
-        #if sensor_wait_seconds and sensor_wait_seconds > 0:
-        #    print_step(f"Sleeping {sensor_wait_seconds:.1f}s before launching stressor ...")
-        #    time.sleep(sensor_wait_seconds)
-
-
-        # Esecuzione scenario
+        # --- 3) Esecuzione scenario (stressor)
         if sc_def.get("stressor"):
             st = sc_def["stressor"]
             st_scenario = st.get("scenario", scenario)
             st_args = st.get("args", {})
-            # Se non specificato, duration default
             if "duration" not in st_args and scenario in ("S2","S3","S5","A1"):
                 st_args["duration"] = default_duration
 
-            # compose command
             py = sys.executable or "python"
             args_list = ["--host", "127.0.0.1", "--port", str(port), "--scenario", st_scenario]
 
-            # flatten args dict (True -> --flag, False/None -> niente, value -> --flag value, list -> ripetuto)
             def _dash(s: str) -> str:
                 return s.replace("_", "-")
 
@@ -553,7 +694,7 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 flag = f"--{_dash(str(k))}"
                 if isinstance(v, bool):
                     if v:
-                        args_list.append(flag)                 # solo flag (es. --epoch-payload)
+                        args_list.append(flag)
                 elif v is None or v == "":
                     continue
                 elif isinstance(v, (list, tuple)):
@@ -562,14 +703,9 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 else:
                     args_list += [flag, str(v)]
 
-            # eventuali extra passati “raw” (stringa) -> splittati in modo sicuro
             extra_list = shlex.split(stressor_extra) if stressor_extra else []
-
-            # comando finale come lista (no shell=True => niente problemi di quoting)
             cmd_list = [py, STRESSOR] + args_list + extra_list
 
-            st_out_path = os.path.join(work_dir, "stressor_stdout.log")
-            st_err_path = os.path.join(work_dir, "stressor_stderr.log")
             st_out = open(st_out_path, "wb")
             st_err = open(st_err_path, "wb")
 
@@ -577,44 +713,51 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 creationflags = 0
                 if os.name == "nt":
                     creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-
                 stress = subprocess.Popen(
                     cmd_list, cwd=HERE, shell=False,
                     stdout=st_out, stderr=st_err,
                     creationflags=creationflags
                 )
-
-                # log del comando effettivo
                 try:
-                    printable = shlex.join(cmd_list)  # Py3.8+
+                    stressor_cmd_printable = shlex.join(cmd_list)
                 except AttributeError:
-                    printable = " ".join(cmd_list)
-                print(f"[runner] Stressor started: {printable}")
-                # opzionale: log anche della mappa args interpretata
+                    stressor_cmd_printable = " ".join(cmd_list)
+                print(f"[runner] Stressor started: {stressor_cmd_printable}")
                 print(f"[runner] Stressor args map: {st_args}")
 
                 timeout = float(sc_def.get("timeout", 0)) or (default_duration + 90)
                 stress.wait(timeout=timeout)
-                
+
                 st_rc = stress.returncode if stress else None
                 if st_rc not in (0, None):
                     result = {
-                        "scenario": scenario,
-                        "name": sc_def.get("name",""),
-                        "uuid": uuid_str,
+                        "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
                         "status": "ERROR",
                         "reason": f"Stressor exited with code {st_rc}",
                         "log": find_sensor_log(log_dir) or sensor_err_path,
                         "sensor_wait_seconds": sensor_wait_seconds,
-                        "stressor_stderr": st_err_path
+                        "stressor_stderr": st_err_path,
+                        "sensor_cmd": sensor_cmd_effective,
+                        "board_mock_cmd": mock_cmd_effective,
+                        "stressor_cmd": stressor_cmd_printable,
+                        "stressor_args": st_args,
+                        "stressor_extra": stressor_extra,
+                        "provenance": provenance,
+                        "logs": {
+                            "sensor_stdout": sensor_out_path,
+                            "sensor_stderr": sensor_err_path,
+                            "mock_stdout": mock_out_path if board_mock_cmd else None,
+                            "mock_stderr": mock_err_path if board_mock_cmd else None,
+                            "stressor_stdout": st_out_path,
+                            "stressor_stderr": st_err_path
+                        }
                     }
-                    # chiudi sensatamente mock+sensor
-                    kill_proc(sensor)
-                    if mock_proc: kill_proc(mock_proc)
-                    # aggiungi informazioni sul motivo dell'errore
+                    # tail utile per HTML
                     tail = _read_tail(st_err_path, max_lines=3)
                     if tail:
-                        result["stressor_error_tail"] = tail                    
+                        result["stressor_error_tail"] = tail
+                    kill_proc(sensor)
+                    if mock_proc: kill_proc(mock_proc)
                     return result
             except Exception:
                 try:
@@ -627,29 +770,31 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 try: st_err.close()
                 except Exception: pass
         else:
-            # scenario S1: niente client; attendi per il tempo configurato
             print(f"[runner] No stressor configured for scenario {scenario} — skipping stressor launch")
             wait_s = float(sc_def.get("sensor_wait_seconds", 25))
             time.sleep(wait_s)
 
-        # permetti al log di drenare
+        # lascia drenare i log
         time.sleep(2.0)
 
-        # chiusura Sensor
+        # --- 4) chiusura processi
         kill_proc(sensor)
-
-        # chiudi il mock, se avviato
         if mock_proc:
             kill_proc(mock_proc)
-            
-        # leggi log
+
+        # --- 5) verifica risultati
         log_path = find_sensor_log(log_dir)
         if not log_path:
-            return {"scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
-                    "status": "ERROR", "reason": "Log file not found"}
+            return {
+                "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
+                "status": "ERROR", "reason": "Log file not found",
+                "sensor_cmd": sensor_cmd_effective,
+                "board_mock_cmd": mock_cmd_effective,
+                "stressor_cmd": stressor_cmd_printable,
+                "provenance": provenance
+            }
 
         content = tail_file(log_path)
-        # verifica pattern
         passed = True
         details = []
         for patt in sc_def.get("patterns", []):
@@ -658,7 +803,6 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 continue
             minv = patt.get("min", None)
             maxv = patt.get("max", None)
-            # count occorrenze (case-insensitive)
             count = len(re.findall(rx, content, flags=re.IGNORECASE))
             ok = True
             if minv is not None and count < int(minv):
@@ -677,10 +821,22 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
             "log": log_path,
             "checks": details,
             "sensor_wait_seconds": sensor_wait_seconds,
+            "sensor_cmd": sensor_cmd_effective,
+            "board_mock_cmd": mock_cmd_effective,
+            "stressor_cmd": stressor_cmd_printable,
+            "provenance": provenance,
+            "logs": {
+                "sensor_stdout": sensor_out_path,
+                "sensor_stderr": sensor_err_path,
+                "mock_stdout": mock_out_path if board_mock_cmd else None,
+                "mock_stderr": mock_err_path if board_mock_cmd else None,
+                "stressor_stdout": st_out_path if sc_def.get("stressor") else None,
+                "stressor_stderr": st_err_path if sc_def.get("stressor") else None
+            }
         }
-        
+
     finally:
-        # terminiamo i processi rimasti
+        # cleanup robusto
         try: kill_proc(stress)
         except Exception: pass
         try: kill_proc(sensor)
@@ -688,13 +844,77 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
         try: kill_proc(mock_proc)
         except Exception: pass
 
-        # chiudiamo SEMPRE i file
         _safe_close(sensor_out)
         _safe_close(sensor_err)
         _safe_close(mock_out)
         _safe_close(mock_err)
+
         
 
+def _git_cmd(cwd, *args):
+    try:
+        # Usare shlex.quote non serve con lista, ma lasciamo robusto
+        out = subprocess.check_output(["git", *args], cwd=cwd, stderr=subprocess.DEVNULL)
+        return out.decode("utf-8", errors="replace").strip()
+    except Exception:
+        return ""
+
+def detect_git_info(cwd, prefer_given_url="", prefer_given_sha=""):
+    """
+    Rileva commit SHA/branch/dirty + remote URL dal repo git in `cwd`.
+    I parametri prefer_given_* hanno priorità, se non vuoti.
+    Ritorna un dict:
+    {
+      "repo_url": "...",
+      "commit_sha": "...", "commit_short": "...",
+      "branch": "...", "dirty": bool
+    }
+    """
+    info = {
+        "repo_url": prefer_given_url or "",
+        "commit_sha": prefer_given_sha or "",
+        "commit_short": "",
+        "branch": "",
+        "dirty": False,
+    }
+
+    # Se già passati da CLI, basta calcolare lo short
+    if info["commit_sha"]:
+        info["commit_short"] = info["commit_sha"][:12]
+        return info
+
+    # Prova a leggere da git (se disponibile)
+    head = _git_cmd(cwd, "rev-parse", "HEAD")
+    if head:
+        info["commit_sha"] = head
+        info["commit_short"] = _git_cmd(cwd, "rev-parse", "--short=12", "HEAD") or head[:12]
+        info["branch"] = _git_cmd(cwd, "rev-parse", "--abbrev-ref", "HEAD")
+        info["dirty"] = bool(_git_cmd(cwd, "status", "--porcelain"))
+        # Prova a prendere l’URL del remote
+        if not info["repo_url"]:
+            url = _git_cmd(cwd, "config", "--get", "remote.origin.url")
+            info["repo_url"] = url or ""
+        return info
+
+    # Fallback “grezzo”: prova a leggere .git/HEAD (se git non c’è nel PATH)
+    try:
+        head_file = os.path.join(cwd, ".git", "HEAD")
+        if os.path.isfile(head_file):
+            with open(head_file, "r", encoding="utf-8", errors="ignore") as f:
+                line = f.read().strip()
+            if line.startswith("ref: "):
+                ref = line.split(" ", 1)[1].strip()
+                info["branch"] = ref.split("/")[-1]
+                ref_file = os.path.join(cwd, ".git", ref.replace("/", os.sep))
+                if os.path.isfile(ref_file):
+                    with open(ref_file, "r", encoding="utf-8", errors="ignore") as f:
+                        sha = f.read().strip()
+                    info["commit_sha"] = sha
+                    info["commit_short"] = sha[:12]
+    except Exception:
+        pass
+
+    return info
 
 def main():
     ap = argparse.ArgumentParser()
@@ -715,7 +935,13 @@ def main():
                     help="Argomenti del mock; {uuid} verrà sostituito con l'UUID del test")
     ap.add_argument("--sensor-wait-seconds", type=float, default=0.0, help="Attendi N secondi dopo che il Sensor è pronto e prima di lanciare lo stressor.")
     ap.add_argument("--stressor-extra", default="", help="Extra CLI to append to tcp_frame_stressor (e.g. \"--epoch-payload\")")
-    
+    ap.add_argument("--auto-git", action="store_true", help="Auto-detect repo URL and commit SHA from local git")
+    ap.add_argument("--append-sha-to-report", action="store_true", help="Append short SHA to report filenames")
+    ap.add_argument("--repo-url",    default=os.getenv("REPO_URL", ""))
+    ap.add_argument("--commit-sha",  default=os.getenv("COMMIT_SHA", ""))
+    ap.add_argument("--branch",      default=os.getenv("BRANCH", ""))
+    ap.add_argument("--dirty",       default=os.getenv("DIRTY", "0"), help="1/true se la working copy ha modifiche locali")
+
     args = ap.parse_args()
 
     # normalizza --only per accettare sia "P1 P2 A1" che "P1,P2,A1"
@@ -741,49 +967,149 @@ def main():
         print("Usa --all oppure --only <SCENARI...>")
         return 2
 
+    # --- Repo/commit metadata
+    repo_meta = {}
+    if args.auto_git or args.repo_url or args.commit_sha:
+        repo_meta = detect_git_info(
+            cwd=args.cwd, 
+            prefer_given_url=args.repo_url, 
+            prefer_given_sha=args.commit_sha
+        )
+    else:
+        repo_meta = {"repo_url":"", "commit_sha":"", "commit_short":"", "branch":"", "dirty": False}
+
+    # Timestamp raccolta
+    collected_at_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
     scenarios = scenario_order if args.all else args.only
     # normalizza work-root → …\Stress-Tests\work
     work_root = os.path.abspath(os.path.join(args.work_root, "work"))
     ensure_dir(work_root)
 
     try:
+        # --- Repo/commit metadata (auto o espliciti da CLI/ENV)
+        if (getattr(args, "auto_git", False) or args.repo_url or args.commit_sha) and "detect_git_info" in globals():
+            repo_meta = detect_git_info(
+                cwd=args.cwd,
+                prefer_given_url=args.repo_url,
+                prefer_given_sha=args.commit_sha
+            )
+        else:
+            # fallback “best effort” se non c'è detect_git_info
+            repo_meta = {
+                "repo_url": getattr(args, "repo_url", ""),
+                "commit_sha": getattr(args, "commit_sha", ""),
+                "commit_short": (getattr(args, "commit_sha", "") or "")[:12],
+                "branch": "",
+                "dirty": False,
+            }
+
+        # opzionale: appende lo short SHA ai nomi file report
+        if getattr(args, "append_sha_to_report", False) and repo_meta.get("commit_short"):
+            short = repo_meta["commit_short"]
+            def _append_sha(path: str) -> str:
+                root, ext = os.path.splitext(os.path.abspath(path))
+                return f"{root}_{short}{ext}"
+            if args.report_json:
+                args.report_json = _append_sha(args.report_json)
+            if args.html_report:
+                args.html_report = _append_sha(args.html_report)
+
+        collected_at_iso = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
         results = []
         for sc in scenarios:
             if sc not in sc_defs:
                 print(f"[WARN] Scenario {sc} non definito in config; skip")
                 continue
             print(f"=== RUN {sc} ===")
-            res = run_scenario(args.sensor_cmd, args.base_port, sc, sc_defs[sc],
-                               cwd_sensor=args.cwd, work_root=work_root,
-                               default_duration=args.duration,
-                               sensor_wait_seconds=args.sensor_wait_seconds,
-                               board_mock_cmd=args.board_mock_cmd,
-                               board_mock_args=args.board_mock_args,
-                               stressor_extra=args.stressor_extra)
-                               
+            res = run_scenario(
+                args.sensor_cmd, args.base_port, sc, sc_defs[sc],
+                cwd_sensor=args.cwd, work_root=work_root,
+                default_duration=args.duration,
+                sensor_wait_seconds=args.sensor_wait_seconds,
+                board_mock_cmd=args.board_mock_cmd,
+                board_mock_args=args.board_mock_args,
+                stressor_extra=args.stressor_extra
+            )
+
+            # Inietta i metadati anche nel risultato del singolo scenario
+            res.update({
+                "repo_url":   repo_meta.get("repo_url", ""),
+                "commit_sha": repo_meta.get("commit_sha", ""),
+                "commit_short": repo_meta.get("commit_short", ""),
+                "branch": repo_meta.get("branch", ""),
+                "dirty": bool(repo_meta.get("dirty", False)),
+            })
+
             results.append(res)
             print(json.dumps(res, indent=2))
             print()
 
+            # --- inject provenance into each test result
+            res.setdefault("provenance", {})
+            res["provenance"]["repo_url"] = args.repo_url or ""
+            res["provenance"]["repo_branch"] = args.branch or ""
+            res["provenance"]["repo_commit"] = args.commit_sha or ""
+            res["provenance"]["runner_sha"] = ""  # opzionale, se vuoi firmare il runner stesso
+
+            # flat fields (per comodità nel report)
+            res["repo_url"] = args.repo_url or ""
+            res["commit_sha"] = args.commit_sha or ""
+            res["commit_short"] = (args.commit_sha[:8] if args.commit_sha else "")
+            res["branch"] = args.branch or ""
+            res["dirty"] = str(args.dirty).lower() not in ("0","false","no","")
+
+
         # sommario
-        n_pass = sum(1 for r in results if r["status"] == "PASS")
-        n_fail = sum(1 for r in results if r["status"] == "FAIL")
-        n_err  = sum(1 for r in results if r["status"] == "ERROR")
+        n_pass = sum(1 for r in results if r.get("status") == "PASS")
+        n_fail = sum(1 for r in results if r.get("status") == "FAIL")
+        n_err  = sum(1 for r in results if r.get("status") == "ERROR")
         print(f"Summary: PASS={n_pass}  FAIL={n_fail}  ERROR={n_err} / {len(results)}")
+
+        summary_dict = {
+            "pass": n_pass,
+            "fail": n_fail,
+            "error": n_err,
+            "total": len(results),
+        }
+
+        # report finale con metadati + risultati
+        final_report = {
+            "collected_at_utc": collected_at_iso,
+            "repo_url": repo_meta.get("repo_url", ""),
+            "commit_sha": repo_meta.get("commit_sha", ""),
+            "commit_short": repo_meta.get("commit_short", ""),
+            "branch": repo_meta.get("branch", ""),
+            "dirty": bool(repo_meta.get("dirty", False)),
+            "summary": summary_dict,
+            "results": results,
+        }
 
         # salvataggi
         if args.report_json:
             ensure_dir(os.path.dirname(os.path.abspath(args.report_json)))
+            meta = {
+                "collected_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "repo_url": args.repo_url or "",
+                "commit_sha": args.commit_sha or "",
+                "commit_short": (args.commit_sha[:8] if args.commit_sha else ""),
+                "branch": args.branch or "",
+                "dirty": str(args.dirty).lower() not in ("0","false","no",""),
+                "summary": { "pass": n_pass, "fail": n_fail, "error": n_err, "total": len(results) }
+            }
             with open(args.report_json, "w", encoding="utf-8") as f:
-                json.dump(results, f, indent=2)
-                
-        pass
+                json.dump({**meta, "results": results}, f, indent=2)
+
+
     except KeyboardInterrupt:
         print("\n[runner] Interrupted by user (Ctrl+C). Stopping.", flush=True)
-        return 1        
+        return 1
 
+    # HTML: passa l'oggetto completo (adatta la funzione se accettava solo 'results')
     if args.html_report:
-        html_report(os.path.abspath(args.html_report), results)
+        html_report(os.path.abspath(args.html_report), final_report)
 
     return 0 if n_fail == 0 and n_err == 0 else 1
 
