@@ -66,8 +66,8 @@ class SocketClient:
             if "SHM_console#" in data.decode():
                 log("[SocketClient] Starting the sampling")
                 
-                # Store the sending moment of 2!!
-                tStamp = int(time.time() * 1000)
+                # Store the sending moment of 2 expressed as microseconds!!
+                tStamp = int(time.time_ns() // 1_000)
 
                 #socket.send(f"M 1;tStamp={tStamp}".encode())
                 if (int(os.getenv('SENSOR_HEADER_ONLY', 0)) == 1):
@@ -80,7 +80,7 @@ class SocketClient:
                 data = socket.recv(1024)
                 if "[OK]" in data.decode():
                     mac = Sensor.get('mac').replace(":", "")  # MAC address of the device
-                    log(f"[SocketClient] Sampling started - MAC: {mac} -- Tstamp: {tStamp}")
+                    log(f"[SocketClient] Sampling started - MAC: {mac} -- Tstamp: {tStamp} [us]")
                     return
                 elif "[KO]" in data.decode():
                     raise ValueError("Something went wrong or just the sensor is already sampling")

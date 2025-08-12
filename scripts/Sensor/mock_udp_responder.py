@@ -7,10 +7,11 @@ Mock "board" that:
   3) (optional) After receiving "2" (start), connects to the server given by "C host:port" and
      streams binary frames that match your C structs:
         report_t {
-          headerReport_t header;           // 36 bytes
+          headerReport_t header;           // 36 + 4 bytes
           adcData_t      dataPayload[N];   // N * 52 bytes
         }
      Cadence: N / sampling_freq seconds (e.g., 10 / 200 = 0.05s).
+     NOTE: timestamps are UNIX epoch in microseconds; per-sample deltaT is uint32 (µs) from frame start (t0).
 """
 
 import argparse
@@ -138,9 +139,10 @@ def build_adc(ts_us: int, avg8, accfir3) -> bytes:
     return struct.pack("<Q8f3f", int(ts_us), *avg8, *accfir3)
 
 def build_report(nreports: int, nchs: int, base_ts_us: int, freq_hz: int, channels_map: str,
-                 header_only: bool=False, header_crc: bool=False, jitter_us: int = 0, epoch_payload: bool = True) -> bytes:
+                 header_only: bool=False, header_crc: bool=False, jitter_us: int = 0) -> bytes:
     """
     Costruisce un frame completo (header + N*adc). Usa un'onda sin/cos per simulare i canali.
+    Timestamps payload sempre in UNIX µs assoluti.
     """
     # Header
     sta = 0
@@ -171,15 +173,10 @@ def build_report(nreports: int, nchs: int, base_ts_us: int, freq_hz: int, channe
     dt = 1.0 / float(max(1, freq_hz))
     step_us = int(round(dt * 1_000_000))
     for k in range(nreports):
-        # timestamp campione in µs:
-        #   - epoch_payload=True  → assoluto UNIX epoch (µs)
-        #   - epoch_payload=False → delta (0, step, 2*step, …) in µs
-        if epoch_payload:
-            ts_us = base_ts_us + k * step_us
-            if jitter_us:
-                ts_us += random.randint(-jitter_us, jitter_us)
-        else:
-            ts_us = k * step_us
+        # timestamp campione in µs → assoluto UNIX epoch (µs)
+        ts_us = base_ts_us + k * step_us
+        if jitter_us:
+            ts_us += random.randint(-jitter_us, jitter_us)
 
         # 8 canali
         avg8 = []
@@ -196,7 +193,7 @@ def build_report(nreports: int, nchs: int, base_ts_us: int, freq_hz: int, channe
 # -----------------------------
 class ConsoleState:
     def __init__(self, uuid, mac, nch, freq, nreports, channels_map, header_crc: bool,
-                 jitter_us: int = 0, epoch_payload: bool = False):
+                 jitter_us: int = 0):
         self.uuid = uuid
         self.mac = mac
         self.nch = nch
@@ -205,7 +202,6 @@ class ConsoleState:
         self.channels_map = channels_map  # 8-char string "11111111"
         self.header_crc = bool(header_crc)
         self.jitter_us = int(jitter_us)
-        self.epoch_payload = bool(epoch_payload)
         self.server_target = None  # (host, port) after "C host:port"
         self.sampling = False
         self.sender_thread = None
@@ -251,7 +247,7 @@ def frame_sender_loop(state: ConsoleState, verbose=False):
                 frame = build_report(
                     state.nreports, state.nch, base_ts, state.freq, state.channels_map,
                     header_only=hdr_only, header_crc=state.header_crc,
-                    jitter_us=state.jitter_us, epoch_payload=state.epoch_payload
+                    jitter_us=state.jitter_us
                 )
                 sock.sendall(frame)
                 if verbose:
@@ -389,20 +385,16 @@ def main():
     ap.add_argument("--nch", type=int, default=8, choices=[4,8], help="Number of channels reported by '1'")
     ap.add_argument("--freq", type=int, default=200, help="Sampling frequency (Hz) reported by '1'")
     ap.add_argument("--nreports", type=int, default=10, help="NUM_DATA_PER_REPORT reported by '1'")
-    ap.add_argument("--channels-map", default="11111111", help="8-char map of channels expected by PacketHandler (digits 1..5)")
+    ap.add_argument("--channels-map", default="11140000", help="8-char map of channels expected by PacketHandler (digits 1..5)")
     ap.add_argument("--send-frames", action="store_true", help="If set, after '2' the mock connects to the server and streams frames")
     ap.add_argument("--verbose", action="store_true", help="Verbose logging")
     ap.add_argument("--header-crc", action="store_true", help="Append CRC32 (IEEE 802.3, LE) to header (makes header 40 bytes)")
     ap.add_argument("--jitter-us", type=int, default=0, help="± jitter in microseconds to add to each sample timestamp")
-    ap.add_argument("--epoch-payload", action="store_true",
-                    help="If set, payload timestamps are absolute UNIX epoch microseconds; otherwise deltas in microseconds starting at 0.")    
     args = ap.parse_args()
-
-    print(f"[mock] epoch payload: {'ENABLED' if args.epoch_payload else 'disabled'}", flush=True)
 
     hostname = socket.gethostname()
     state = ConsoleState(args.uuid, args.mac, args.nch, args.freq, args.nreports, args.channels_map,
-                         header_crc=args.header_crc, jitter_us=args.jitter_us, epoch_payload=args.epoch_payload)
+                         header_crc=args.header_crc, jitter_us=args.jitter_us)
 
     state.send_frames_enabled = bool(args.send_frames)
 

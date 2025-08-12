@@ -2,9 +2,9 @@
 # -*- coding: utf-8 -*-
 """
 TCP Frame Stressor per il modulo Sensor:
-genera frame conformi all'handler (header 36B, report 52B) e applica
+genera frame conformi all'handler (header 36B/40B, report 52B) e applica
 variazioni (flapping, jitter, header-only, nreports variabile, framespezzati,
-garbage, oversize/undersize, ms vs µs, trigger allarmi).
+garbage, oversize/undersize, trigger allarmi).
 
 Uso rapido:
   python tcp_frame_stressor.py --host 127.0.0.1 --port 5000 --scenario S2 --duration 10
@@ -30,6 +30,8 @@ HEADER_BASE_LEN = 36   # 36B fissi; con CRC diventano 40
 HEADER_LEN = 40
 REPORT_LEN = 52  # 8 ts + 8*4 floats + 3*4 floats
 
+def now_us() -> int: 
+    return time.time_ns() // 1_000
 
 def connect(host, port, timeout=10.0):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -88,7 +90,7 @@ def build_header(nreports: int,
                  fft: int = 0,
                  chmax: int = 0,
                  nChannels: int = 1,
-                 tstamp_ms: int = None,
+                 tstamp_us: int = None,
                  metrics: Optional[List[float]] = None,
                  datafmt: int = 0,
                  header_crc: bool = False) -> bytes:
@@ -97,7 +99,7 @@ def build_header(nreports: int,
       0..1  : sync A5 5A
       2     : pre1 => [fft(1) | stalta(1) | datafmt(2, 0) | nreports(4)]
       3     : pre2 => [chmax(2) | nch(1) | headerOnly(1) | reserved(4)]
-      4..11 : tstamp_fft_ms (uint64 LE)
+      4..11 : tstamp_fft_us (uint64 LE)  # UNIX µs
       12..35: 6 * float32 metrics
 
     Se header_crc=True, appende 4 byte (uint32 LE) con CRC-32/IEEE calcolato sui primi 36B.
@@ -106,9 +108,9 @@ def build_header(nreports: int,
     pre2 = ((chmax & 0x3)) | ((1 if nChannels else 0) << 2) | ((1 if header_only else 0) << 3)
     sync = b'\xA5\x5A'
 
-    if tstamp_ms is None:
-        tstamp_ms = int(time.time() * 1000)
-    ts8 = struct.pack('<Q', int(tstamp_ms))
+    if tstamp_us is None:
+        tstamp_us = now_us()
+    ts8 = struct.pack('<Q', int(tstamp_us))
 
     if metrics is None:
         metrics = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -128,7 +130,7 @@ def build_header(nreports: int,
 
 
 def build_report(delta_ts:int, vals8:List[float], filt3:List[float]) -> bytes:
-    """delta_ts in ms o µs (il PacketHandler normalizza)."""
+    """Timestamp nel payload (uint64 LE). Qui passiamo SEMPRE epoch µs assoluti."""
     if len(vals8) != 8: raise ValueError("vals8 deve essere 8 float")
     if len(filt3) != 3: raise ValueError("filt3 deve essere 3 float")
     ts = struct.pack('<Q', int(delta_ts))
@@ -138,9 +140,6 @@ def build_report(delta_ts:int, vals8:List[float], filt3:List[float]) -> bytes:
     return ts + body
 
 def build_report_epoch(ts_epoch_us: int, accel: List[float] = None, filt: List[float] = None) -> bytes:
-    """
-    Wrapper: identico a build_report() ma il primo campo è un timestamp UNIX epoch in microsecondi.
-    """
     vals8 = accel if accel is not None else [0.0]*8
     filt3 = filt  if filt  is not None else [0.0]*3
     return build_report(ts_epoch_us, vals8, filt3)
@@ -154,26 +153,21 @@ def build_report_delta(delta_us: int, accel: List[float] = None, filt: List[floa
     return build_report(delta_us, vals8, filt3)
 
 
-def one_frame(nreports:int, start_ts:int, ts_step_ms:float,
-              microseconds:bool=False) -> Tuple[bytes,int]:
-    """Costruisce un frame completo (header+payload) con timestamp di payload come delta (ms o µs).
-       Ritorna (frame_bytes, last_delta_ms)."""
-    header = build_header(nreports=nreports, header_only=False, stalta=0, fft=0, chmax=0, nChannels=1)
+def one_frame(nreports:int, start_ts_us:int, ts_step_us:float) -> Tuple[bytes,int]:
+    """Costruisce un frame completo (header+payload) con payload timestamps = epoch µs assoluti.
+       Ritorna (frame_bytes, last_delta_us)."""
+    header = build_header(nreports=nreports, header_only=False, stalta=0, fft=0, chmax=0, nChannels=1, tstamp_us=start_ts_us)
     payload = b''
-    last_delta = 0
-    for i in range(nreports):
-        delta_ms = int(round(i * ts_step_ms))
-        last_delta = delta_ms
-        if microseconds:
-            delta = delta_ms * 1000
-        else:
-            delta = delta_ms
-        # 8 raw + 3 filt: numeri fittizi (onde sinusoidi + temperatura)
-        t = (start_ts + delta_ms)/1000.0
+    last_delta_us = 0
+    for i in range(max(0, int(nreports))):
+        ts_us = start_ts_us + int(round(i * ts_step_us))
+        last_delta_us = ts_us - start_ts_us
+        # valori fittizi (8 raw + 3 filt)
         vals8 = [0.1*i + 0.01*random.random() for i in range(8)]
         filt3 = [0.05*i for i in range(3)]
-        payload += build_report(delta, vals8, filt3)
-    return header + payload, last_delta
+        payload += build_report_epoch(ts_us, vals8, filt3)
+    return header + payload, last_delta_us
+
 
 def one_frame_epoch(nreports:int, start_epoch_us:int, ts_step_us:int) -> Tuple[bytes,int]:
     """
@@ -214,38 +208,38 @@ def scenario_S2_flapping(host, port, duration=10.0, period=0.2):
 def scenario_S3_jitter(host, port, duration=10.0, nreports=10, freq=200, jitter_ms=(0,200)):
     s = connect(host, port)
     start = time.time()
-    base_ts = 0
+    base_ts = now_us()
     while time.time() - start < duration:
-        frame, _ = one_frame(nreports, base_ts, ts_step_ms=1000.0/freq)
+        frame, _ = one_frame(nreports, base_ts, ts_step_us=1_000_000.0/freq)
         send_all(s, frame)
         time.sleep(random.uniform(jitter_ms[0], jitter_ms[1]) / 1000.0)
-        base_ts += int(1000*nreports/freq)
+        base_ts += int(1_000_000.0*nreports/freq)
     s.close()
 
 def scenario_S4_pause(host, port, warmup=0.0, pause=10.0, tail=0.0, freq=200):
     """Connetti → (opz) manda un frame di warmup → PAUSA lunga → (opz) manda un frame finale → chiudi."""
     import sys, time
     s = connect(host, port)
-    base_ts = 0
-    period_ms = 1000.0 / float(freq)
+    base_ts = now_us()
+    period_us = 1_000_000.0 / float(freq)
 
     print(f"[stressor] S4 start: warmup={warmup}s pause={pause}s tail={tail}s", file=sys.stdout, flush=True)
 
     # warmup: manda 1 frame (nr scelto in base al tempo, ma troncato a 10 per stare sul sicuro)
     if warmup > 0.0:
-        nr = max(1, min(10, int(round(warmup * freq))))
-        frame, _ = one_frame(nr, base_ts, period_ms)
+        nr = max(1, int(round(warmup * freq)))
+        frame, _ = one_frame(nr, base_ts, period_us)
         print(f"[stressor] S4 warmup: send nreports={nr} bytes={len(frame)}", file=sys.stdout, flush=True)
         send_all(s, frame)
-        base_ts += int(round(1000.0 * nr / float(freq)))
+        base_ts += int(round(1_000_000.0 * nr / float(freq)))
 
     # PAUSA vera (socket vivo, nessun byte)
     time.sleep(max(0.0, pause))
 
     # tail: manda 1 frame finale
     if tail > 0.0:
-        nr = max(1, min(10, int(round(tail * freq))))
-        frame, _ = one_frame(nr, base_ts, period_ms)
+        nr = max(1, int(round(tail * freq)))
+        frame, _ = one_frame(nr, base_ts, period_us)
         print(f"[stressor] S4 tail:   send nreports={nr} bytes={len(frame)}", file=sys.stdout, flush=True)
         send_all(s, frame)
 
@@ -256,30 +250,30 @@ def scenario_S4_pause(host, port, warmup=0.0, pause=10.0, tail=0.0, freq=200):
 def scenario_S5_throughput(host, port, duration=5.0, nreports=20, freq=400):
     s = connect(host, port)
     start = time.time()
-    base_ts = 0
+    base_ts = now_us()
     while time.time() - start < duration:
-        frame, _ = one_frame(nreports, base_ts, 1000.0/freq)
+        frame, _ = one_frame(nreports, base_ts, 1_000_000.0/freq)
         send_all(s, frame)
         # niente sleep → massimo throughput
-        base_ts += int(1000*nreports/freq)
+        base_ts += int(1_000_000.0*nreports/freq)
     s.close()
 
 def scenario_P1_split(host, port, nframes=50, nreports=10, freq=200, split=5):
     s = connect(host, port)
-    base_ts = 0
+    base_ts = now_us()
     for _ in range(nframes):
-        frame, _ = one_frame(nreports, base_ts, 1000.0/freq)
+        frame, _ = one_frame(nreports, base_ts, 1_000_000.0/freq)
         send_all(s, frame, split=split)
-        base_ts += int(1000*nreports/freq)
+        base_ts += int(1_000_000.0*nreports/freq)
     s.close()
 
 def scenario_P2_garbage(host, port, nframes=20, nreports=10, freq=200, garbage=64):
     s = connect(host, port)
-    base_ts = 0
+    base_ts = now_us()
     for _ in range(nframes):
-        frame, _ = one_frame(nreports, base_ts, 1000.0/freq)
+        frame, _ = one_frame(nreports, base_ts, 1_000_000.0/freq)
         send_all(s, frame, garbage=garbage)
-        base_ts += int(1000*nreports/freq)
+        base_ts += int(1_000_000.0*nreports/freq)
     s.close()
 
 def scenario_P3_header_only(host, port, nheaders=20, freq=200):
@@ -288,12 +282,12 @@ def scenario_P3_header_only(host, port, nheaders=20, freq=200):
     """
     print(f"[stressor] P3 start: nheaders={nheaders}", file=sys.stdout, flush=True)
     try:
-        s = connect(host, port); base_ts = 0; period = 1000.0/float(freq)
+        s = connect(host, port); base_ts = now_us(); period_us = 1_000_000.0/float(freq)
         for _ in range(nheaders):
             # header-only: nreports=0 e payload vuoto
-            frame, _ = one_frame(0, base_ts, period)   # one_frame deve accettare nreports=0
+            frame, _ = one_frame(0, base_ts, period_us)   # one_frame deve accettare nreports=0
             send_all(s, frame)
-            base_ts += int(round(1000.0 * 10 / freq))
+            # no-op su base_ts (nreports=0)
             time.sleep(0.002)
         s.close()
         print("[stressor] P3 done.", file=sys.stdout, flush=True)
@@ -305,7 +299,7 @@ def scenario_P3_header_only(host, port, nheaders=20, freq=200):
 def scenario_P4_varnrep(host, port, duration=12.0, freq=200, seq=None):
     print(f"[stressor] P4 start: duration={duration}s", flush=True)
     try:
-        s = connect(host, port)
+        s = connect(host, port); base_ts = now_us(); period_us = 1_000_000.0/float(freq)
         # sequenza di nreports variabile (parametrizzabile da CLI)
         seq = seq or [10, 8, 6, 4]
         t_end = time.time() + duration
@@ -380,18 +374,19 @@ def scenario_P5_oversize_undersize(host, port, duration=8.0, freq=200):
             else:
                 p5_under += 1
 
-            # payload “nr_payload” report
-            payload = b"".join(
-                build_report(0, [0.02]*8, [0.0]*3)  # riusa builder esistente
-                for _ in range(nr_payload)
-            )
+            # payload “nr_payload” report con epoch µs coerenti
+            start_ts = now_us()
+            step_us  = 1_000_000.0/float(freq)
+            payload = b"".join(build_report_epoch(start_ts + int(round(i*step_us)), [0.02]*8, [0.0]*3)
+                        for i in range(nr_payload)
+                    )
 
             if do_over:
                 # OVERSIZE: aggiungi junk che NON contenga sync e poi *subito* un header del frame successivo
                 # così il Sensor vede boundary≠sync, trova la prossima sync (j1) e logga got>exp.
                 junk = junk_no_sync(8)  # pochi byte bastano, l’importante è “no sync” nel junk
                 next_head = build_header(
-                    nreports=nr_hdr, header_only=True,  # header-only valida dopo il resync
+                    nreports=nr_hdr, header_only=True,  # header-only valido dopo il resync
                     stalta=0, fft=0, chmax=15, nChannels=1
                 )
                 frame = head + payload + junk + next_head
@@ -399,7 +394,7 @@ def scenario_P5_oversize_undersize(host, port, duration=8.0, freq=200):
                 # UNDERSIZE: invia solo frame corto; il mismatch verrà rilevato quando arriva il frame successivo
                 frame = head + payload
 
-            print(f"[stressor] P5 sent header_nreports={nr_hdr} payload_reports={nr_payload} bytes={len(frame)}", flush=True)
+            print(f"[stressor] P5 sent header_nreports={nr_hdr} payload_reports={nr_payload} ({'OVER' if do_over else 'UNDER'})", flush=True)
             send_all(s, frame)
 
             toggle = not toggle
@@ -439,19 +434,16 @@ def scenario_P6(host, port, headerlen=HEADER_LEN, basedatalen=REPORT_LEN,
         traceback.print_exc(file=sys.stderr); sys.exit(1)
 
 
-def scenario_T1_epoch_or_delta(host, port, nframes=20, nreports=10, freq=200, epoch_payload=False, header_crc=False):
+def scenario_T1(host, port, nframes=20, nreports=10, freq=200, header_crc=False):
     """
     T1: invia nframes con nreports ciascuno.
-    - Se epoch_payload=True: il campo timestamp nel payload è un UNIX epoch in microsecondi
+    - Il campo timestamp nel payload è un UNIX epoch in microsecondi
       che avanza di step_us=1e6/freq a campione.
-    - Altrimenti: timestamp relativo (delta) che simula lo stesso passo, ma in µs dal primo campione.
     """
     step_us = int(round(1_000_000 / max(1, int(freq))))
-    # apri la connessione al server del Sensor
     s = connect(host, port)
-    start_epoch_us = int(time.time() * 1_000_000)
-
-    print(f"[stressor] T1 epoch-payload: start_epoch_us={start_epoch_us} step_us={step_us} nframes={nframes}", flush=True)
+    start_epoch_us = now_us()
+    print(f"[stressor] T1: start_epoch_us={start_epoch_us} step_us={step_us} nframes={nframes}", flush=True)
 
     sent = 0
     last_ts_us = None
@@ -459,28 +451,14 @@ def scenario_T1_epoch_or_delta(host, port, nframes=20, nreports=10, freq=200, ep
     try:
         for fidx in range(int(nframes)):
             # header: nreports costante, header_only=False
-            head = build_header(nreports=nreports, header_only=False, stalta=0, fft=0, chmax=15, nChannels=1, header_crc=header_crc)
+            head = build_header(nreports=nreports, header_only=False, stalta=0, fft=0, chmax=15, nChannels=1, header_crc=header_crc, tstamp_us=start_epoch_us + (fidx*nreports*step_us))
 
             # costruisci payload
             payload_chunks = []
             for r in range(int(nreports)):
-                if epoch_payload:
-                    ts_us = start_epoch_us + (sent * step_us)
-                    last_ts_us = ts_us
-                    rpt = build_report_epoch(
-                        ts_us,
-                        accel=[0.02]*8,
-                        filt=[0.0]*3
-                    )
-                else:
-                    # delta in µs dal primo campione
-                    ts_us = (sent * step_us)
-                    last_ts_us = start_epoch_us + ts_us  # solo per il riepilogo
-                    rpt = build_report(
-                        ts_us,
-                        accel=[0.02]*8,
-                        filt=[0.0]*3
-                    )
+                ts_us = start_epoch_us + (sent * step_us)
+                last_ts_us = ts_us
+                rpt = build_report_epoch(ts_us, accel=[0.02]*8, filt=[0.0]*3)
                 payload_chunks.append(rpt)
                 sent += 1
 
@@ -488,10 +466,11 @@ def scenario_T1_epoch_or_delta(host, port, nframes=20, nreports=10, freq=200, ep
             send_all(s, frame)
 
             # opzionale: un piccolo yield per non saturare tutto
-            # time.sleep(0.001)
+            #time.sleep(0.001)
+            time.sleep(0.1)
 
         s.close()
-        print(f"[stressor] T1 epoch-payload summary: first_ts_us={start_epoch_us} last_ts_us={last_ts_us} total_smples={sent} step_us={step_us}", flush=True)
+        print(f"[stressor] T1 done. first_ts_us={start_epoch_us} last_ts_us={last_ts_us} total_smples={sent} step_us={step_us}", flush=True)
         sys.exit(0)
     except Exception:
         traceback.print_exc(file=sys.stderr)
@@ -623,7 +602,7 @@ SCENARIOS = {
     "P4": scenario_P4_varnrep,
     "P5": scenario_P5_oversize_undersize,
     "P6": scenario_P6,
-    "T1": scenario_T1_epoch_or_delta,
+    "T1": scenario_T1,
     "A1": scenario_A1_sta_lta,
     "A2": scenario_A2_fft_single,
     "A3": scenario_A3_alarm_trigger,
@@ -633,15 +612,15 @@ SCENARIOS = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--port", type=int, default=5000)
-    ap.add_argument("--scenario", choices=sorted(SCENARIOS.keys()), required=True)
-    ap.add_argument("--duration", type=float, default=10.0, help="Durata in secondi (dove ha senso)")
-    ap.add_argument("--freq", type=float, default=200.0, help="Frequenza campionamento (Hz)")
+    ap.add_argument("--port",      type=int, default=5000)
+    ap.add_argument("--scenario",  choices=sorted(SCENARIOS.keys()), required=True)
+    ap.add_argument("--duration",  type=float, default=10.0, help="Durata in secondi (dove ha senso)")
+    ap.add_argument("--freq",      type=float, default=200.0, help="Frequenza campionamento (Hz)")
     ap.add_argument("--header-crc", action="store_true", help="Append CRC32 (IEEE 802.3, LE) to header (makes header 40 bytes)")
 
     # P1: frame spezzati
     ap.add_argument("--nframes", type=int, default=20, help="Numero di frame da inviare (P1/P2/T1)")
-    ap.add_argument("--split", type=int, default=1, help="Numero di segmenti per frame (P1)")
+    ap.add_argument("--split",   type=int, default=1, help="Numero di segmenti per frame (P1)")
 
     # P2: garbage tra i frame
     ap.add_argument("--garbage", type=int, default=0, help="Byte casuali tra i frame (P2)")
@@ -656,18 +635,15 @@ def main():
     ap.add_argument("--nreports", type=int, default=10, help="nreports per P5/P6")
 
     # P6: sync dentro il payload
-    ap.add_argument("--headerlen", type=int, default=36, help="Lunghezza header (P6)")
+    ap.add_argument("--headerlen",   type=int, default=36, help="Lunghezza header (P6)")
     ap.add_argument("--basedatalen", type=int, default=52, help="Lunghezza report (P6)")
-    ap.add_argument("--preamble", type=str, default="A55A", help="Sync word esadecimale (P6)")
+    ap.add_argument("--preamble",    type=str, default="A55A", help="Sync word esadecimale (P6)")
 
-    # T1: timestamp in microsecondi (simulazione)
-    ap.add_argument("--epoch-payload", action="store_true", help="Per T1: genera timestamp del payload in epoch µs (modello board)")
-    
     # A1: alarm STA/LTA with headerOnly ratio
     ap.add_argument("--headerOnlyRatio", type=float, default=0.0, help="Header only ratio (A1)")
 
     # A2: finestra pre/post
-    ap.add_argument("--pre", type=float, default=3.0, help="Secondi prima dell'evento (A2)")
+    ap.add_argument("--pre",  type=float, default=3.0, help="Secondi prima dell'evento (A2)")
     ap.add_argument("--post", type=float, default=3.0, help="Secondi dopo l'evento (A2)")
 
     # S4 (pausa lunga) - li avevamo già aggiunti, ma ricordo qui per completezza
@@ -712,7 +688,7 @@ def main():
                   freq=args.freq)
     elif args.scenario == "T1":
         # undersize + oversize
-        kw = dict(nframes=args.nframes, nreports=10, freq=args.freq, epoch_payload=bool(args.epoch_payload), header_crc=bool(args.header_crc))
+        kw = dict(nframes=args.nframes, nreports=10, freq=args.freq, header_crc=bool(args.header_crc))
     elif args.scenario == "A1":
         # STA-LTA prolungato no FFT con HeaderOnly opzionali
         kw = dict(duration=args.duration, freq=args.freq, header_only_ratio=args.headerOnlyRatio)
