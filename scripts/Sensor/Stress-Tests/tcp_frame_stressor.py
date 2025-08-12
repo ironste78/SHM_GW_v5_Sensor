@@ -93,7 +93,7 @@ def build_header(nreports: int,
                  tstamp_us: int = None,
                  metrics: Optional[List[float]] = None,
                  datafmt: int = 0,
-                 header_crc: bool = False) -> bytes:
+                 header_crc: bool = True) -> bytes:
     """
     Header base = 36B:
       0..1  : sync A5 5A
@@ -104,6 +104,9 @@ def build_header(nreports: int,
 
     Se header_crc=True, appende 4 byte (uint32 LE) con CRC-32/IEEE calcolato sui primi 36B.
     """
+    # Safety check
+    assert nreports <= 10
+
     pre1 = ((1 if fft else 0) << 7) | ((1 if stalta else 0) << 6) | ((datafmt & 0x3) << 4) | (nreports & 0xF)
     pre2 = ((chmax & 0x3)) | ((1 if nChannels else 0) << 2) | ((1 if header_only else 0) << 3)
     sync = b'\xA5\x5A'
@@ -156,7 +159,8 @@ def build_report_delta(delta_us: int, accel: List[float] = None, filt: List[floa
 def one_frame(nreports:int, start_ts_us:int, ts_step_us:float) -> Tuple[bytes,int]:
     """Costruisce un frame completo (header+payload) con payload timestamps = epoch µs assoluti.
        Ritorna (frame_bytes, last_delta_us)."""
-    header = build_header(nreports=nreports, header_only=False, stalta=0, fft=0, chmax=0, nChannels=1, tstamp_us=start_ts_us)
+    headerOnly = False if nreports>0 else True
+    header = build_header(nreports=nreports, header_only=headerOnly, stalta=0, fft=0, chmax=0, nChannels=1, tstamp_us=start_ts_us)
     payload = b''
     last_delta_us = 0
     for i in range(max(0, int(nreports))):
@@ -169,26 +173,6 @@ def one_frame(nreports:int, start_ts_us:int, ts_step_us:float) -> Tuple[bytes,in
     return header + payload, last_delta_us
 
 
-def one_frame_epoch(nreports:int, start_epoch_us:int, ts_step_us:int) -> Tuple[bytes,int]:
-    """
-    Variante: payload timestamps in EPOCH µs (modello “board”).
-    - header tFFT = start_epoch_us
-    - ogni report ha ts = start_epoch_us + i*ts_step_us
-    Ritorna (frame_bytes, last_step_us).
-    """
-    header = build_header(nreports=nreports, header_only=False,
-                          stalta=0, fft=0, chmax=0, nChannels=1,
-                          tfft_us=start_epoch_us)
-    payload = b""
-    last_us = 0
-    for i in range(nreports):
-        ts_us = int(start_epoch_us + i*ts_step_us)
-        last_us = i*ts_step_us
-        # valori fittizi canali
-        vals8 = [0.1*i + 0.01*random.random() for i in range(8)]
-        filt3 = [0.05*i for i in range(3)]
-        payload += build_report(ts_us, vals8, filt3)
-    return header + payload, last_us
 
 
 # ---------------- Scenari ----------------
@@ -247,16 +231,30 @@ def scenario_S4_pause(host, port, warmup=0.0, pause=10.0, tail=0.0, freq=200):
     print("[stressor] S4 done.", file=sys.stdout, flush=True)
 
 
-def scenario_S5_throughput(host, port, duration=5.0, nreports=20, freq=400):
+def scenario_S5_throughput(host, port, duration=5.0, nreports=10, freq=1000):
+    """
+    Throughput “alto ma realistico”: timestamp ancorati al tempo reale e pacing = nreports/freq.
+    Evita future-drift > slack lato Sensor.
+    """
     s = connect(host, port)
-    start = time.time()
-    base_ts = now_us()
-    while time.time() - start < duration:
-        frame, _ = one_frame(nreports, base_ts, 1_000_000.0/freq)
+    period_s_per_report = float(nreports) / float(freq)  # es. 10/200 = 0.05 s
+    t_end = time.time() + float(duration)
+    target_next = time.perf_counter()
+    while time.time() < t_end:
+        # Timestamp del frame = ora (t0), payload = t0 + k*step
+        t0_us = now_us()
+        frame, _ = one_frame(nreports, t0_us, 1_000_000.0/float(freq))
         send_all(s, frame)
-        # niente sleep → massimo throughput
-        base_ts += int(1_000_000.0*nreports/freq)
+        # pacing
+        target_next += period_s_per_report
+        sleep_left = target_next - time.perf_counter()
+        if sleep_left > 0:
+            time.sleep(sleep_left)
+        else:
+            # siamo in ritardo: riallinea target, così non accumuliamo drift
+            target_next = time.perf_counter()
     s.close()
+
 
 def scenario_P1_split(host, port, nframes=50, nreports=10, freq=200, split=5):
     s = connect(host, port)
@@ -308,9 +306,11 @@ def scenario_P4_varnrep(host, port, duration=12.0, freq=200, seq=None):
             nr = seq[idx % len(seq)]
             # header con nreports variabile (no header-only)
             head = build_header(nreports=nr, header_only=False, stalta=0, fft=0, chmax=20, nChannels=1)
-            # payload coerente con nr (frame valido!)
+            # payload coerente con nr: timestamp epoch µs
+            start_ts = now_us()
+            step_us  = 1_000_000.0/float(freq)
             payload = b''.join(
-                build_report(0, [0.01]*8, [0.0]*3) for _ in range(nr)
+                build_report_epoch(start_ts + int(round(i*step_us)), [0.01]*8, [0.0]*3) for i in range(nr)
             )
             frame = head + payload
             print(f"[stressor] P4 frame#{idx} nreports={nr} bytes={len(frame)}", flush=True)
@@ -418,8 +418,10 @@ def scenario_P6(host, port, headerlen=HEADER_LEN, basedatalen=REPORT_LEN,
     """
     print(f"[stressor] P6 start: nreports={nreports} preamble={preamble}", file=sys.stdout, flush=True)
     try:
-        s = connect(host, port); base_ts = 0; period = 1000.0/float(freq)
-        frame, _ = one_frame(nreports, base_ts, period)
+        s = connect(host, port)
+        base_ts = now_us()
+        period_us = 1_000_000.0/float(freq)
+        frame, _ = one_frame(nreports, base_ts, period_us)
         # inserisci sync dopo l'header (preservando TUTTI i 40B, CRC incluso)
         sync = binascii.unhexlify(preamble)
         payload = bytearray(frame[headerlen:])
@@ -497,11 +499,15 @@ def scenario_A1_sta_lta(host, port, duration=35.0, freq=200, header_only_ratio=0
         while time.time() < t_end:
             do_header_only = (header_only_ratio > 0.0 and (toggle_hdr % int(1.0 / max(1e-9, header_only_ratio)) == 0))
             head = build_header(nreports=10, header_only=do_header_only, stalta=1, fft=0, chmax=15, nChannels=1)
+
             if do_header_only:
                 frame = head  # solo header
             else:
-                payload = b"".join(build_report(0, [0.01]*8, [0.0]*3) for _ in range(10))
+                start_ts = now_us()
+                step_us  = 1_000_000.0/float(freq)
+                payload = b"".join(build_report_epoch(start_ts + int(round(i*step_us)), [0.01]*8, [0.0]*3) for i in range(10))
                 frame = head + payload
+
             send_all(s, frame)
             toggle_hdr += 1
             time.sleep(period)
@@ -527,7 +533,9 @@ def scenario_A2_fft_single(host, port, pre=3.0, post=3.0, freq=200):
         t_end = time.time() + seconds
         while time.time() < t_end:
             head = build_header(nreports=nrep, header_only=False, stalta=stalta, fft=fft, chmax=10, nChannels=1)
-            payload = b"".join(build_report(0, [0.02]*8, [0.0]*3) for _ in range(nrep))
+            start_ts = now_us()
+            step_us  = 1_000_000.0/float(freq)
+            payload = b"".join(build_report_epoch(start_ts + int(round(i*step_us)), [0.03]*8, [0.0]*3) for i in range(10))
             send_all(s, head + payload)
             time.sleep(period)
 
@@ -538,7 +546,9 @@ def scenario_A2_fft_single(host, port, pre=3.0, post=3.0, freq=200):
         # breve burst con FFT=1 per innescare RAISE
         for _ in range(4):
             head = build_header(nreports=10, header_only=False, stalta=0, fft=1, chmax=12, nChannels=1)
-            payload = b"".join(build_report(0, [0.03]*8, [0.0]*3) for _ in range(10))
+            start_ts = now_us()
+            step_us  = 1_000_000.0/float(freq)
+            payload = b"".join(build_report_epoch(start_ts + int(round(i*step_us)), [0.03]*8, [0.0]*3) for i in range(10))
             send_all(s, head + payload)
             time.sleep(period)
 
@@ -569,18 +579,24 @@ def scenario_A3_alarm_trigger(host, port, pre=3.0, post=3.0, freq=200):
         t_end = time.time() + pre
         while time.time() < t_end:
             head = build_header(nreports=10, header_only=False, stalta=1, fft=0, chmax=10, nChannels=1)
-            payload = b''.join(build_report(0, [0.01]*8, [0.0]*3) for _ in range(10))
+            start_ts = now_us()
+            step_us  = 1_000_000.0/float(freq)
+            payload = b''.join(build_report_epoch(start_ts + int(round(i*step_us)), [0.01]*8, [0.0]*3) for i in range(10))
             send_all(s, head + payload)
             time.sleep(10 / float(freq))
         # singolo trigger FFT
         head = build_header(nreports=10, header_only=False, stalta=1, fft=1, chmax=90, nChannels=1)
-        payload = b''.join(build_report(0, [1.0]*8, [0.0]*3) for _ in range(10))
+        start_ts = now_us()
+        step_us  = 1_000_000.0/float(freq)
+        payload = b''.join(build_report_epoch(start_ts + int(round(i*step_us)), [1.0]*8, [0.0]*3) for i in range(10))
         send_all(s, head + payload)
         # baseline post
         t_end = time.time() + post
         while time.time() < t_end:
             head = build_header(nreports=10, header_only=False, stalta=0, fft=0, chmax=10, nChannels=1)
-            payload = b''.join(build_report(0, [0.01]*8, [0.0]*3) for _ in range(10))
+            start_ts = now_us()
+            step_us  = 1_000_000.0/float(freq)
+            payload = b''.join(build_report_epoch(start_ts + int(round(i*step_us)), [0.01]*8, [0.0]*3) for i in range(10))
             send_all(s, head + payload)
             time.sleep(10 / float(freq))
         s.close()

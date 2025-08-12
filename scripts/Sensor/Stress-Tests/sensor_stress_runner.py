@@ -35,6 +35,174 @@ HERE = os.path.abspath(os.path.dirname(__file__))
 DEFAULT_WORK_ROOT = os.path.join(HERE, "work")
 STRESSOR = os.path.join(HERE, "tcp_frame_stressor.py")
 
+# -------- UTF-8 hardening (Windows-safe) --------
+def _force_utf8_stdio():
+    try:
+        # Python 3.7+: reconfigure stdio encoding
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+    # Propaga anche a figli e librerie
+    os.environ.setdefault("PYTHONUTF8", "1")
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+def _deepcopy(obj):
+    return json.loads(json.dumps(obj))
+
+def _resolve_ref(cfg: dict, ref: str):
+    """
+    Risolve riferimenti tipo "@globals/forbidden_patterns" oppure "@globals/file_checks".
+    Ritorna l'oggetto referenziato, oppure None.
+    """
+    if not isinstance(ref, str) or not ref.startswith("@"):
+        return None
+    parts = ref[1:].split("/")
+    cur = cfg
+    for p in parts:
+        if isinstance(cur, dict) and p in cur:
+            cur = cur[p]
+        else:
+            return None
+    return _deepcopy(cur)
+
+def _expand_patterns(cfg: dict, sc_def: dict):
+    """
+    Converte il nuovo schema in una lista uniforme di pattern:
+      - 'must_appear': ciascun item -> {"re":..., "min":...}
+      - 'must_not_appear': ciascun item -> {"re":..., "max":0}
+      - Supporta riferimenti "@globals/forbidden_patterns"
+      - Mantiene compatibilità con il vecchio campo 'patterns'
+    """
+    patterns = []
+    # compatibilità col vecchio formato
+    if "patterns" in sc_def and isinstance(sc_def["patterns"], list):
+        for p in sc_def["patterns"]:
+            rx = p.get("re") or p.get("pattern")
+            if not rx:
+                continue
+            patterns.append({
+                "pattern": rx,
+                "min": p.get("min"),
+                "max": p.get("max")
+            })
+    # nuovo formato
+    for key, default in (("must_appear", "min"), ("must_not_appear", "max")):
+        lst = sc_def.get(key, [])
+        if not isinstance(lst, list):
+            continue
+        for item in lst:
+            # riferimento?
+            ref_obj = _resolve_ref(cfg, item) if isinstance(item, str) else None
+            src = ref_obj if ref_obj is not None else item
+            if not src:
+                continue
+            if isinstance(src, list):
+                # lista di pattern [{re/max/min/...}, ...]
+                for p in src:
+                    rx = p.get("re") or p.get("pattern")
+                    if not rx:
+                        continue
+                    entry = {"pattern": rx}
+                    if default == "min":
+                        entry["min"] = p.get("min", 1)
+                        if "max" in p: entry["max"] = p["max"]
+                    else:
+                        entry["max"] = p.get("max", 0)
+                        if "min" in p: entry["min"] = p["min"]
+                    patterns.append(entry)
+            elif isinstance(src, dict):
+                rx = src.get("re") or src.get("pattern")
+                if not rx:
+                    continue
+                entry = {"pattern": rx}
+                if default == "min":
+                    entry["min"] = src.get("min", 1)
+                    if "max" in src: entry["max"] = src["max"]
+                else:
+                    entry["max"] = src.get("max", 0)
+                    if "min" in src: entry["min"] = src["min"]
+                patterns.append(entry)
+    return patterns
+
+def _merge_file_checks(glob_fc: dict, sc_fc: dict):
+    out = _deepcopy(glob_fc or {})
+    for k, v in (sc_fc or {}).items():
+        if k == "@inherit":
+            continue
+        out[k] = v
+    return out
+
+def _resolve_file_checks(cfg: dict, sc_def: dict):
+    """
+    Risolve la sezione file_checks:
+      - supporta "@globals/file_checks"
+      - supporta {"@inherit": "@globals/file_checks", ...override...}
+    Ritorna dict finale (o {} se non definito).
+    """
+    sc_fc = sc_def.get("file_checks")
+    if sc_fc is None:
+        return {}
+    if isinstance(sc_fc, str):
+        ref = _resolve_ref(cfg, sc_fc)
+        return ref or {}
+    if isinstance(sc_fc, dict):
+        inh = sc_fc.get("@inherit")
+        base = _resolve_ref(cfg, inh) if isinstance(inh, str) else {}
+        return _merge_file_checks(base, sc_fc)
+    return {}
+
+def _rotated_candidates(base_path: str, max_backups: int = 9) -> list[str]:
+    """
+    Restituisce [base_path.N ... base_path.1, base_path] se esistono.
+    Ordine: dal più vecchio al corrente (così trovi anche righe antiche).
+    """
+    paths = []
+    for i in range(max_backups, 0, -1):
+        p = f"{base_path}.{i}"
+        if os.path.isfile(p):
+            paths.append(p)
+    if os.path.isfile(base_path):
+        paths.append(base_path)
+    return paths
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read()
+    except Exception:
+        return ""
+
+
+# --- helper: check sensor ready by logs or TCP ---
+def _sensor_ready(work_dir: str, host: str, port: int, marker_res: list[str], start_time: float) -> bool:
+    import socket
+    def _read_txt(p: str) -> str:
+        try:
+            with open(p, "r", encoding="utf-8", errors="replace") as fh:
+                return fh.read()
+        except Exception:
+            return ""
+    # (B) TCP probe: decisivo se già su
+    try:
+        with socket.create_connection((host, int(port)), timeout=0.25):
+            print(f"[runner] Sensor TCP {host}:{port} is open.")
+            return True
+    except Exception:
+        pass
+    # (A) marker nei log (stdout + stderr)
+    out = _read_txt(os.path.join(work_dir, "sensor_stdout.log"))
+    err = _read_txt(os.path.join(work_dir, "sensor_stderr.log"))
+    txt = out + "\n" + err
+    for rx in marker_res:
+        if re.search(rx, txt, flags=re.IGNORECASE):
+            print(f"[runner] Found log marker '{rx}' in sensor logs.")
+            return True
+    # heartbeat ogni ~2s
+    if (time.time() - start_time) > 2 and int((time.time() - start_time) % 5) == 0:
+        print("[runner] waiting sensor server marker / tcp ready...")
+    return False
+
 # -------------------- Config --------------------
 
 _BUILTIN_CONFIG = {
@@ -218,6 +386,13 @@ def run_cmd(cmd: str, cwd=None, env=None, detach=False) -> subprocess.Popen:
     creationflags = 0
     if os.name == "nt":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+    env = os.environ.copy()
+    env.setdefault("PYTHONUTF8", "1")
+    env.setdefault("PYTHONIOENCODING", "utf-8")
+    # (facoltativo) per alcune console Windows:
+    env.setdefault("CLICOLOR_FORCE", "1")
+
     return subprocess.Popen(cmd, cwd=cwd, env=env, shell=True,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                             creationflags=creationflags)
@@ -321,7 +496,7 @@ def kill_proc(proc: subprocess.Popen):
     except Exception:
         pass
 
-def tail_file(path: str, nbytes: int = 400_000) -> str:
+def tail_file(path: str, nbytes: int = 1_000_000) -> str:
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
@@ -512,7 +687,7 @@ td.details .checks li.bad {{ color:#ad2c24; font-weight:600; }}
 
 
 # -------------------- Core --------------------
-def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, Any],
+def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, Any], cfg_globals: Dict[str, Any],
                  cwd_sensor: str, work_root: str, default_duration: float = 12.0, sensor_wait_seconds: float = 0.0,
                  board_mock_cmd: Optional[str] = None, board_mock_args: Optional[str] = None, stressor_extra: str = "") -> Dict[str, Any]:
     sensor = stress = mock_proc = None
@@ -555,6 +730,13 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
             mock_err = open(mock_err_path, "wb")
             print_step(f"Starting board mock: {mock_cmd_effective}")
             creationflags = (subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0)
+
+            # Aggiungi variabili UTF-8 direttamente a mock_env
+            mock_env.setdefault("PYTHONUTF8", "1")
+            mock_env.setdefault("PYTHONIOENCODING", "utf-8")
+            # (facoltativo) per alcune console Windows:
+            mock_env.setdefault("CLICOLOR_FORCE", "1")
+
             mock_proc = subprocess.Popen(
                 mock_cmd_effective, cwd=HERE, env=mock_env, shell=True,
                 stdout=mock_out, stderr=mock_err,
@@ -584,13 +766,23 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
         env["LOG_DIR"] = log_dir
         env["RUN_DIR"] = os.path.join(work_dir, "run")
         env["SENSOR_ALLOW_UNREGISTERED"] = "1"
+        # (opzionale ma consigliato in test) disabilita update verso DB/TSDB
+        env["SENSOR_UPDATE_SENSOR"] = "0"   # evita HTTP verso il DB (porta 7001) durante gli stress test
+
         ensure_dir(env["RUN_DIR"])
+
+        # Harden UTF-8 SOLO aggiungendo chiavi, senza rifare la copy
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        # (facoltativo) per alcune console Windows:
+        env.setdefault("CLICOLOR_FORCE", "1")
 
         sensor_out = open(sensor_out_path, "wb")
         sensor_err = open(sensor_err_path, "wb")
 
         sensor_cmd_effective = f'{sensor_cmd} -su {uuid_str} -sp {port} -sh 127.0.0.1'
         print_step(f"Starting Sensor: (cwd={cwd_sensor}) {sensor_cmd_effective}")
+
         sensor = subprocess.Popen(
             sensor_cmd_effective, cwd=cwd_sensor, env=env, shell=True,
             stdout=sensor_out, stderr=sensor_err,
@@ -620,17 +812,37 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 }
             }
 
-        print_step("Waiting for 'Socket server opened ...' marker in Sensor log ...")
-        if not wait_server_opened(log_dir, port, timeout=30.0):
+
+        print_step("Waiting for Sensor server ready (log marker or TCP)...")
+        marker_res = [
+            r"Socket server opened",                      # classico
+            r"Socket server open",                        # varianti
+            r"\[SocketServer\].*(opened|listening|bound|bind|port)",
+            r"Server listening on .*:\d+",
+        ]
+        host = "127.0.0.1"
+        t0 = time.time()
+        wait_sec = 30.0  # puoi anche usare max(8.0, float(sensor_wait_seconds) or 8.0)
+
+        while time.time() - t0 < wait_sec:
+            if _sensor_ready(work_dir, host, port, marker_res, t0):
+                break
+            time.sleep(0.25)
+        else:
             kill_proc(sensor)
-            if mock_proc: kill_proc(mock_proc)
+            if mock_proc:
+                kill_proc(mock_proc)
             return {
-                "scenario": scenario, "name": sc_def.get("name",""), "uuid": uuid_str,
-                "status": "ERROR", "reason": "Sensor did not open server (no log marker)",
-                "log": find_sensor_log(log_dir) or sensor_err_path,
+                "scenario": scenario,
+                "name": sc_def.get("name",""),
+                "uuid": uuid_str,
+                "status": "ERROR",
+                "reason": "Sensor did not open server (no log marker / tcp not ready)",
+                "log": os.path.join(work_dir, "sensor_stderr.log"),
                 "sensor_cmd": sensor_cmd_effective,
                 "provenance": provenance
             }
+
         t_open_seen = time.time()
 
         time.sleep(1.2)
@@ -713,10 +925,18 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 creationflags = 0
                 if os.name == "nt":
                     creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+                env = os.environ.copy()
+                env.setdefault("PYTHONUTF8", "1")
+                env.setdefault("PYTHONIOENCODING", "utf-8")
+                # (facoltativo) per alcune console Windows:
+                env.setdefault("CLICOLOR_FORCE", "1")
+
                 stress = subprocess.Popen(
                     cmd_list, cwd=HERE, shell=False,
                     stdout=st_out, stderr=st_err,
-                    creationflags=creationflags
+                    creationflags=creationflags,
+                    env=env
                 )
                 try:
                     stressor_cmd_printable = shlex.join(cmd_list)
@@ -794,25 +1014,139 @@ def run_scenario(sensor_cmd: str, port: int, scenario: str, sc_def: Dict[str, An
                 "provenance": provenance
             }
 
-        content = tail_file(log_path)
+        content = tail_file(log_path, nbytes=1_000_000)
         passed = True
         details = []
-        for patt in sc_def.get("patterns", []):
-            rx = patt.get("re") or patt.get("pattern")
+        # --- nuovo formato: must_appear/must_not_appear (con fallback a "patterns")
+        patterns = _expand_patterns({"globals": (cfg_globals or {})}, sc_def)
+        if not patterns:
+            # fallback hard al vecchio campo patterns
+            patterns = []
+            for patt in sc_def.get("patterns", []):
+                rx = patt.get("re") or patt.get("pattern")
+                if not rx:
+                    continue
+                patterns.append({"pattern": rx, "min": patt.get("min"), "max": patt.get("max")})
+
+
+        for patt in patterns:
+            rx = patt.get("pattern")
             if not rx:
                 continue
             minv = patt.get("min", None)
             maxv = patt.get("max", None)
+
+            # 1) Conteggio sul tail del log corrente
             count = len(re.findall(rx, content, flags=re.IGNORECASE))
+
+            # 2) Se serve soddisfare "min", fallback al full del corrente
+            if minv is not None and count < int(minv):
+                try:
+                    with open(log_path, "r", encoding="utf-8", errors="replace") as _fh:
+                        full_text = _fh.read()
+                    count_full = len(re.findall(rx, full_text, flags=re.IGNORECASE))
+                    if count_full != count:
+                        print(f"[runner] Pattern '{rx}' trovato anche nel full log corrente: +{count_full - count} match")
+                    count = count_full
+                except Exception:
+                    pass
+
+            # 3) Se ancora insufficiente, cerca anche nei log RUOTATI (base.log.N → base.log)
+            if minv is not None and count < int(minv):
+                cand = _rotated_candidates(log_path, max_backups=9)
+                if cand:
+                    extra = 0
+                    for p in cand:  # include anche il corrente, ma ormai lo abbiamo già full‑scannato
+                        if p == log_path:
+                            continue
+                        txt = _read_text(p)
+                        extra += len(re.findall(rx, txt, flags=re.IGNORECASE))
+                    if extra > 0:
+                        print(f"[runner] Pattern '{rx}' trovato nei log ruotati: +{extra} match")
+                        count += extra
+
+            # 4) Forbidden (max=0): somma i match da STDERR (già implementato)
+            if maxv is not None and int(maxv) == 0:
+                stderr_path = os.path.join(work_dir, "sensor_stderr.log")
+                if os.path.isfile(stderr_path):
+                    try:
+                        stderr_text = _read_text(stderr_path)
+                        count_stderr = len(re.findall(rx, stderr_text, flags=re.IGNORECASE))
+                        if count_stderr > 0:
+                            print(f"[runner] Pattern '{rx}' trovato nello stderr: +{count_stderr} match")
+                        count += count_stderr
+                    except Exception:
+                        pass
+
+            # (Opzionale) Must-appear: includi anche stdout
+            if minv is not None and count < int(minv):
+                stdout_path = os.path.join(work_dir, "sensor_stdout.log")
+                if os.path.isfile(stdout_path):
+                    txt = _read_text(stdout_path)
+                    add = len(re.findall(rx, txt, flags=re.IGNORECASE))
+                    if add > 0:
+                        print(f"[runner] Pattern '{rx}' trovato in sensor_stdout.log: +{add} match")
+                        count += add
+
+            # 5) Valutazione finale
             ok = True
             if minv is not None and count < int(minv):
                 ok = False
             if maxv is not None and count > int(maxv):
                 ok = False
+
             details.append({"pattern": rx, "count": count, "matched": ok, "min": minv, "max": maxv})
             if not ok:
                 passed = False
 
+        # --- file_checks opzionali (validator)
+        #   schema atteso (dopo resolve):
+        #   {enabled: bool, validator_relpath: str, data_dir_relpath: str, tolerance_us: int, acc_range: [min,max], temp_range: [min,max], strict: bool}
+        fc = _resolve_file_checks({"globals": (cfg_globals or {})}, sc_def)
+        if isinstance(fc, dict) and fc.get("enabled"):
+            py = sys.executable or "python"
+            validator = os.path.abspath(os.path.join(HERE, fc.get("validator_relpath", "..\\validate_shm_files.py")))
+            data_dir  = os.path.abspath(os.path.join(HERE, fc.get("data_dir_relpath", "..\\..\\..\\data")))
+            json_out  = os.path.join(work_dir, "validation.json")
+            tol_us    = str(int(fc.get("tolerance_us", 0)))
+            acc_rng   = fc.get("acc_range", None)
+            tmp_rng   = fc.get("temp_range", None)
+            strict    = bool(fc.get("strict", True))
+
+            cmd = [py, validator, data_dir, "--pattern", "shm_*_05_*_*", "--json-out", json_out, "--tolerance-us", tol_us]
+            if isinstance(acc_rng, (list, tuple)) and len(acc_rng) == 2:
+                cmd += ["--acc-range", str(acc_rng[0]), str(acc_rng[1])]
+            if isinstance(tmp_rng, (list, tuple)) and len(tmp_rng) == 2:
+                cmd += ["--temp-range", str(tmp_rng[0]), str(tmp_rng[1])]
+            if strict:
+                cmd += ["--strict"]
+
+            try:
+                rc = subprocess.call(cmd, cwd=HERE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=False)
+            except Exception as e:
+                rc = 2
+                details.append({"pattern": "<validator-run>", "count": 1, "matched": False, "min": None, "max": None, "error": str(e)})
+                passed = False
+            else:
+                # prova a leggere l'output JSON per arricchire i dettagli
+                vc_detail = {"pattern": "<validator>", "count": 1, "rc": rc}
+                try:
+                    if os.path.isfile(json_out):
+                        with open(json_out, "r", encoding="utf-8") as f:
+                            j = json.load(f)
+                        vc_detail.update({
+                            "files_total": j.get("files_total"),
+                            "files_ok": j.get("files_ok"),
+                            "files_warn": j.get("files_warn"),
+                            "files_error": j.get("files_error"),
+                        })
+                except Exception:
+                    pass
+                # Lo consideriamo check bloccante se rc!=0
+                vc_detail["matched"] = (rc == 0)
+                details.append(vc_detail)
+                if rc != 0:
+                    passed = False
         return {
             "scenario": scenario,
             "name": sc_def.get("name",""),
@@ -917,6 +1251,7 @@ def detect_git_info(cwd, prefer_given_url="", prefer_given_sha=""):
     return info
 
 def main():
+    _force_utf8_stdio()
     ap = argparse.ArgumentParser()
     ap.add_argument("--sensor-cmd", required=True,
                     help='Comando per avviare il Sensor, es: "py main.py --config ..\\..\\..\\exec\\windows\\config.ini"')
@@ -962,6 +1297,7 @@ def main():
     cfg = load_config(args.config)
     scenario_order = cfg.get("scenario_order") or []
     sc_defs = cfg.get("scenarios") or {}
+    cfg_globals = cfg.get("globals") or {}
 
     if not args.all and not args.only:
         print("Usa --all oppure --only <SCENARI...>")
@@ -1025,7 +1361,7 @@ def main():
                 continue
             print(f"=== RUN {sc} ===")
             res = run_scenario(
-                args.sensor_cmd, args.base_port, sc, sc_defs[sc],
+                args.sensor_cmd, args.base_port, sc, sc_defs[sc], cfg_globals,
                 cwd_sensor=args.cwd, work_root=work_root,
                 default_duration=args.duration,
                 sensor_wait_seconds=args.sensor_wait_seconds,

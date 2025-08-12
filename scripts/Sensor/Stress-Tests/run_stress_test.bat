@@ -18,6 +18,8 @@ REM   run_stress_test.bat P1 P2 A1   -> run P1,P2,A1 (spaces ok)
 cd /d "%SCRIPT_DIR%"
 
 REM --------- Common settings ----------
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 set "PY=python"
 set "SENSOR_CMD=python main.py --config ..\exec\windows\config.ini --allow-unregistered"
 set "CWD=D:\SHMSource\SHM_GW_v5\LocalVersion\@Sensor"
@@ -77,7 +79,7 @@ if /I "%TEST_SCENARIOS%"=="all" (
 
 REM --- Se il runner fallisce ---
 if errorlevel 1 (
-  echo [launcher] Tests failed (code %ERRORLEVEL%)
+  echo [launcher] Tests failed (code %ERRORLEVEL%^)
   endlocal & exit /b %ERRORLEVEL%
 )
 

@@ -32,13 +32,12 @@ class AccelerometerStorer:
         cls.START_SAMPLING_TIMESTAMP = timestamp
 
     ## Accelerometer data ##
-
     def save(self, data: list, delta_timestamp: int, rxTstamp: int):
-        """Save accelerometer data as hex text line:
-           <deltaT> <ax> <ay> <az> <temp>
-           - deltaT: uint32 big-endian hex (µs from first sample)
-           - ax,ay,az,temp: float32 big-endian hex
+        """Salva i campioni in BINARIO:
+           record = <deltaT:uint32 LE> <ax:float32 LE> <ay:float32 LE> <az:float32 LE> <temp:float32 LE>
+           dove deltaT è in microsecondi rispetto al primo campione del file (t0).
         """
+
         try:
             delta_us = self.__validate_timestamps(delta_timestamp)
             if delta_us is None:
@@ -48,26 +47,25 @@ class AccelerometerStorer:
             self.__setup_output_stream(rxTstamp)
 
             # Convert values (incoming chunks are 4B little-endian floats from PacketHandler)
-            vals = data[:4]  # 3 accel + 1 temp
-            tokens = []
-            # deltaT as u32 BE
-            tokens.append(int(delta_us).to_bytes(4, 'big', signed=False).hex())
+            vals = data[:4]  # ax, ay, az, temp
+            floats = []
             for b in vals:
                 if not isinstance(b, (bytes, bytearray)) or len(b) != 4:
-                    continue
-                f = struct.unpack('<f', b)[0]
-                tokens.append(struct.pack('!f', f).hex())
+                    raise ValueError("[AccelerometerStorer] invalid float bytes in chunk")
+                floats.append(struct.unpack('<f', b)[0])
 
-            line = " ".join(tokens) + "\n"
+            # Impacchetta il record binario: deltaT uint32 LE + 4 float32 LE
+            # If wants bigg-endian format, just use '!Iffff'
+            record = struct.pack('<Iffff', int(delta_us), floats[0], floats[1], floats[2], floats[3])
 
             if self.output_stream:
-                self.output_stream.write(line.encode())
-                self.output_stream_counter += len(line)
+                self.output_stream.write(record)
+                self.output_stream_counter += len(record)  # in bytes
 
-                # keep also legacy rotation by duration to avoid huge files
-                if self.output_stream_counter >= (len(line) * self.frequency * self.file_duration):
+                # Rotazione per durata: bytes_per_record (20) * freq * file_duration
+                bytes_per_record = 4 + 4*4
+                if self.output_stream_counter >= (bytes_per_record * self.frequency * self.file_duration):
                     self.__close_file()
-            else:
                 raise ValueError('[AccelerometerStorer] Output stream is not available')
         except Exception as e:
             raise ValueError(f"[AccelerometerStorer] Some error: {e}")
@@ -117,11 +115,12 @@ class AccelerometerStorer:
         if not self.output_stream:
             # Absolute begin = t0_us
             self.begin_tStamp_filename = self.start_delta_timestamp
-            tmp_name = f'shm_{self.mac}_05_{self.begin_tStamp_filename}.dat'
+            # file temporaneo (estensione .part)
+            tmp_name = f'shm_{self.mac}_05_{self.begin_tStamp_filename}.part'
             filepath = os.path.join(self.temp_directory, tmp_name)
 
             # 3. Open the file (binary; we write encoded text lines)
-            self.output_stream = open(filepath, 'ab', buffering=0)
+            self.output_stream = open(filepath, 'ab')
             self.__send_status(3, "Sampling")
 
         # keep end updated to last absolute timestamp
@@ -132,7 +131,8 @@ class AccelerometerStorer:
         # Reset the output stream
         if self.output_stream:
             # Move the file to the data directory
-            filename = f'shm_{self.mac}_05_{self.begin_tStamp_filename}.dat'
+            # Name of the temporary file file in .temp folder
+            tmp_filename = f'shm_{self.mac}_05_{self.begin_tStamp_filename}.part'
 
             # OPTION1: TODO When using rxTstamp, here put a timing reference to be computed more accurately later as the rxTime of the last sample
             #self.end_tStamp_filename = int(time.time() * 1000)
@@ -141,7 +141,8 @@ class AccelerometerStorer:
             # OPTION3: The board is synchronized through the Discovery, then it sends directly the posix time
             self.end_tStamp_filename = self.last_delta_timestamp
 
-            dst_filename = f'shm_{self.mac}_05_{self.begin_tStamp_filename}_{(self.end_tStamp_filename)}'
+            # Final file name in data/ (with .dat)
+            dst_filename = f'shm_{self.mac}_05_{self.begin_tStamp_filename}_{self.end_tStamp_filename}.dat'
 
             #filename = f'shm_{self.mac}_05_{self.START_SAMPLING_TIMESTAMP + self.start_delta_timestamp}.dat'
             #dst_filename = f'shm_{self.mac}_05_{self.START_SAMPLING_TIMESTAMP + self.start_delta_timestamp}_{(self.START_SAMPLING_TIMESTAMP + self.last_delta_timestamp)}'
@@ -154,8 +155,11 @@ class AccelerometerStorer:
             # directory di destinazione garantita
             os.makedirs(self.directory, exist_ok=True)
             # move atomico anche cross-platform
-            os.replace(os.path.join(self.temp_directory, filename), os.path.join(self.directory, dst_filename))
-            
+            os.replace(
+                os.path.join(self.temp_directory, tmp_filename),
+                os.path.join(self.directory, dst_filename)
+            )
+             
             
             self.output_stream = None
 

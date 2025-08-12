@@ -1,25 +1,21 @@
 #!/usr/bin/env python3
 """
-validate_shm_files.py
+validate_shm_files.py  (BINARIO)
 
-Validator per file SHM prodotti dal modulo Sensor.
+Validator per file SHM prodotti dallo Storer (formato binario).
 
-Formato atteso del filename (finalizzato):
-  shm_<MAC>_05_<t0_us>_<t1_us>
+Filename finale atteso:
+  shm_<MAC>_05_<t0_us>_<t1_us>.dat
 
-Righe file (testuali, esadecimali):
-  <deltaT> <ax> <ay> <az> <temp>
-  - deltaT: uint32 big-endian (8 cifre hex), microsecondi dal primo campione (t0)
-  - ax, ay, az, temp: float32 big-endian (8 cifre hex ciascuno)
+Record binario (20 B ciascuno):
+  <deltaT:uint32 LE> <ax:float32 LE> <ay:float32 LE> <az:float32 LE> <temp:float32 LE>
+  - deltaT: microsecondi dal primo campione (t0)
+  - ax, ay, az, temp: float32 LE
 
 Uscita:
   - Codice 0 se tutto OK
   - Codice 1 se solo warning
   - Codice 2 se errori
-
-Uso:
-  python tools/validate_shm_files.py path1 [path2 ...]
-  Opzioni: vedi --help
 """
 import argparse
 import os
@@ -31,15 +27,17 @@ import json
 from pathlib import Path
 from typing import List, Dict, Any, Tuple
 
+# shm_<MAC12>_05_<t0>_<t1>.dat  (t0/t1 in µs)
 FILENAME_RE = re.compile(
-    r'^shm_([0-9A-Fa-f]{12})_05_(\d{10,20})_(\d{10,20})$'
+    r'^shm_([0-9A-Fa-f]{12})_05_(\d{10,20})_(\d{10,20})\.dat$'
 )
 
-LINE_TOKEN_RE = re.compile(r'\s+')
+RECORD_SIZE = 4 + 4*4  # 20 bytes
+RECORD_STRUCT = struct.Struct('<Iffff')
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Validator per file SHM (timestamp µs, deltaT u32 BE, valori float32 BE).",
+        description="Validator per file SHM binari (deltaT u32 LE, valori float32 LE).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     p.add_argument('paths', nargs='+', help='File o directory (ricorsivo) da validare')
@@ -49,7 +47,8 @@ def parse_args() -> argparse.Namespace:
                    default=None, help='Range plausibile per accelerometri (g) per warning')
     p.add_argument('--temp-range', type=float, nargs=2, metavar=('MIN', 'MAX'),
                    default=None, help='Range plausibile per temperatura (°C) per warning')
-    p.add_argument('--pattern', default='shm_*_05_*_*', help='Glob per selezionare i file (se path è directory)')
+    p.add_argument('--pattern', default='shm_*_05_*_*.dat',
+                   help='Glob per selezionare i file (se path è directory)')
     p.add_argument('--json-out', type=str, default=None, help='Scrive un report JSON nel percorso indicato')
     p.add_argument('--strict', action='store_true', help='Tratta i warning come errori (exit code 2)')
     return p.parse_args()
@@ -67,26 +66,6 @@ def iter_candidate_files(paths: List[str], pattern: str) -> List[Path]:
     files = [f for f in files if f.is_file()]
     return sorted(files, key=lambda x: str(x))
 
-def decode_u32_be_hex(token: str) -> Tuple[int, str]:
-    token = token.strip()
-    if len(token) != 8:
-        return -1, f"deltaT non ha 8 cifre hex (len={len(token)})"
-    try:
-        return int(token, 16), ""
-    except ValueError:
-        return -1, "deltaT non è esadecimale valido"
-
-def decode_f32_be_hex(token: str) -> Tuple[float, str]:
-    token = token.strip()
-    if len(token) != 8:
-        return float('nan'), f"float32 non ha 8 cifre hex (len={len(token)})"
-    try:
-        b = bytes.fromhex(token)
-        val = struct.unpack('!f', b)[0]
-        return val, ""
-    except Exception as e:
-        return float('nan'), f"float32 non valido: {e}"
-
 def validate_file(path: Path, tol_us: int, acc_range, temp_range) -> Dict[str, Any]:
     name = path.name
     m = FILENAME_RE.match(name)
@@ -96,24 +75,25 @@ def validate_file(path: Path, tol_us: int, acc_range, temp_range) -> Dict[str, A
         "warnings": [],
         "errors": [],
         "stats": {
-            "lines": 0,
-            "bad_lines": 0,
+            "records": 0,
+            "bad_records": 0,
             "max_delta_us": 0,
-            "first_line_delta_us": None,
-            "last_line_delta_us": None,
+            "first_delta_us": None,
+            "last_delta_us": None,
             "t0_us": None,
-            "t1_us": None
+            "t1_us": None,
+            "filesize": path.stat().st_size
         }
     }
+
     if not m:
-        result["errors"].append("Filename non conforme: atteso shm_<MAC12>_05_<t0>_<t1>")
+        result["errors"].append("Filename non conforme: atteso shm_<MAC12>_05_<t0>_<t1>.dat")
         result["ok"] = False
         return result
 
     mac_hex, t0_s, t1_s = m.groups()
     try:
-        t0 = int(t0_s)
-        t1 = int(t1_s)
+        t0 = int(t0_s); t1 = int(t1_s)
     except ValueError:
         result["errors"].append("t0/t1 non numerici")
         result["ok"] = False
@@ -121,78 +101,94 @@ def validate_file(path: Path, tol_us: int, acc_range, temp_range) -> Dict[str, A
     result["stats"]["t0_us"] = t0
     result["stats"]["t1_us"] = t1
 
+    size = result["stats"]["filesize"]
+    if size == 0:
+        result["warnings"].append("File vuoto (0 bytes)")
+        return result
+    if size % RECORD_SIZE != 0:
+        result["errors"].append(f"Dimensione file non multipla di {RECORD_SIZE} B (size={size})")
+        result["ok"] = False
+        # Proviamo comunque a leggere le parti intere, segnando come bad il trailing
+        readable_bytes = size - (size % RECORD_SIZE)
+    else:
+        readable_bytes = size
+
     last_delta = None
-    with path.open('rt', encoding='utf-8', errors='replace') as fh:
-        for idx, line in enumerate(fh, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            result["stats"]["lines"] += 1
-            tokens = re.split(r'\s+', line.strip())
-            if len(tokens) < 5:
-                result["errors"].append(f"Linea {idx}: attesi 5 token, trovati {len(tokens)}")
-                result["stats"]["bad_lines"] += 1
-                result["ok"] = False
-                continue
 
-            delta_us, err = decode_u32_be_hex(tokens[0])
-            if err:
-                result["errors"].append(f"Linea {idx}: {err}")
-                result["stats"]["bad_lines"] += 1
+    with path.open('rb') as fh:
+        # Lettura a blocchi per efficienza
+        # (ma RECORD_SIZE è piccolo: va bene anche record‑per‑record)
+        idx = 0
+        while idx * RECORD_SIZE < readable_bytes:
+            buf = fh.read(RECORD_SIZE)
+            if not buf:
+                break
+            if len(buf) != RECORD_SIZE:
+                result["errors"].append(f"Record troncato a offset {idx*RECORD_SIZE} (len={len(buf)})")
+                result["stats"]["bad_records"] += 1
                 result["ok"] = False
-                continue
+                break
 
-            if delta_us < 0 or delta_us > 0xFFFFFFFF:
-                result["errors"].append(f"Linea {idx}: deltaT fuori range uint32 ({delta_us})")
-                result["stats"]["bad_lines"] += 1
+            try:
+                delta_us, ax, ay, az, temp = RECORD_STRUCT.unpack(buf)
+            except Exception as e:
+                result["errors"].append(f"Record {idx}: unpack fallito ({e})")
+                result["stats"]["bad_records"] += 1
                 result["ok"] = False
-                continue
+                break
 
-            if result["stats"]["first_line_delta_us"] is None:
-                result["stats"]["first_line_delta_us"] = delta_us
-            result["stats"]["last_line_delta_us"] = delta_us
+            # Statistiche
+            if result["stats"]["first_delta_us"] is None:
+                result["stats"]["first_delta_us"] = delta_us
+            result["stats"]["last_delta_us"] = delta_us
             if delta_us > result["stats"]["max_delta_us"]:
                 result["stats"]["max_delta_us"] = delta_us
+            result["stats"]["records"] += 1
 
+            # deltaT monotono
             if last_delta is not None and delta_us < last_delta:
-                result["errors"].append(f"Linea {idx}: deltaT non monotono ({delta_us} < {last_delta})")
+                result["errors"].append(f"Record {idx}: deltaT non monotono ({delta_us} < {last_delta})")
                 result["ok"] = False
             last_delta = delta_us
 
-            vals = []
-            for j in range(1, 5):
-                v, ferr = decode_f32_be_hex(tokens[j])
-                if ferr:
-                    result["errors"].append(f"Linea {idx}: {ferr}")
-                    result["stats"]["bad_lines"] += 1
+            # Controlli valori
+            # (NaN/Inf e range se richiesto)
+            comps = [(ax, 'ax'), (ay, 'ay'), (az, 'az')]
+            for v, label in comps:
+                if not math.isfinite(v):
+                    result["errors"].append(f"Record {idx}: {label} non finito (NaN/Inf)")
                     result["ok"] = False
-                    break
-                vals.append(v)
-            if len(vals) == 4:
-                ax, ay, az, temp = vals
-                if acc_range is not None:
+                elif acc_range is not None:
                     mn, mx = acc_range
-                    for comp, label in [(ax,'ax'), (ay,'ay'), (az,'az')]:
-                        if not math.isfinite(comp):
-                            result["errors"].append(f"Linea {idx}: {label} non finito (NaN/Inf)")
-                            result["ok"] = False
-                        elif comp < mn or comp > mx:
-                            result["warnings"].append(f"Linea {idx}: {label} fuori range {mn}..{mx}: {comp}")
-                if temp_range is not None:
-                    mn, mx = temp_range
-                    if not math.isfinite(temp):
-                        result["errors"].append(f"Linea {idx}: temperatura non finita (NaN/Inf)")
-                        result["ok"] = False
-                    elif temp < mn or temp > mx:
-                        result["warnings"].append(f"Linea {idx}: temperatura fuori range {mn}..{mx}: {temp}")
+                    if v < mn or v > mx:
+                        result["warnings"].append(f"Record {idx}: {label} fuori range {mn}..{mx}: {v}")
 
-    last = result["stats"]["last_line_delta_us"]
+            if not math.isfinite(temp):
+                result["errors"].append(f"Record {idx}: temperatura non finita (NaN/Inf)")
+                result["ok"] = False
+            elif temp_range is not None:
+                mn, mx = temp_range
+                if temp < mn or temp > mx:
+                    result["warnings"].append(f"Record {idx}: temperatura fuori range {mn}..{mx}: {temp}")
+
+            idx += 1
+
+        # bytes residui (se size non multiplo)
+        leftover = size - readable_bytes
+        if leftover:
+            result["errors"].append(f"Byte residui non multipli di {RECORD_SIZE}: {leftover} B")
+            result["ok"] = False
+
+    # Coerenza t1 filename
+    last = result["stats"]["last_delta_us"]
     if last is None:
-        result["warnings"].append("File vuoto o senza righe valide")
+        result["warnings"].append("File senza record validi")
     else:
         expected_t1 = t0 + last
         if abs(expected_t1 - t1) > tol_us:
-            result["errors"].append(f"t1 nel filename ({t1}) non combacia con t0+last_delta ({expected_t1}) ±{tol_us}µs")
+            result["errors"].append(
+                f"t1 nel filename ({t1}) != t0+last_delta ({expected_t1}) ±{tol_us}µs"
+            )
             result["ok"] = False
 
     return result
@@ -231,8 +227,8 @@ def main() -> int:
         elif d["warnings"]:
             status = "WARN"
         fname = Path(d["file"]).name
-        lines = d["stats"]["lines"]
-        print(f" - {fname}: {status} (righe={lines})")
+        recs = d["stats"]["records"]
+        print(f" - {fname}: {status} (records={recs})")
         if d["errors"]:
             for e in d["errors"][:5]:
                 print(f"    * {e}")
