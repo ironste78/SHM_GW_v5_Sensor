@@ -26,6 +26,7 @@ except Exception:
 # ---- utilities base: crea un frame "valido" con nreports ----
 # Assunzioni: preambolo A55A (2B), header=40B (36 core + 4 CRC), report=52B.
 
+HEADER_BASE_LEN = 36   # 36B fissi; con CRC diventano 40
 HEADER_LEN = 40
 REPORT_LEN = 52  # 8 ts + 8*4 floats + 3*4 floats
 
@@ -114,13 +115,13 @@ def build_header(nreports: int,
     mbytes = b''.join(struct.pack('<f', float(x)) for x in metrics[:6])
 
     head36 = sync + bytes([pre1, pre2]) + ts8 + mbytes
-    assert len(head36) == 36
+    assert len(head36) == HEADER_BASE_LEN
 
     if header_crc:
         # CRC-32 IEEE 802.3 (reflected) – stesso risultato di zlib.crc32
-        crc = zlib.crc32(head36) & 0xFFFFFFFF
+        crc = crc32_compute(head36)
         head = head36 + struct.pack('<I', crc)
-        assert len(head) == 40
+        assert len(head) == HEADER_LEN
         return head
     else:
         return head36

@@ -29,7 +29,7 @@ REM ----------------------------------------------------------
 
 REM --- provenance (metti i tuoi valori reali) ---
 set REPO_URL=https://github.com/ironste78/SHM_GW_v5_Sensor.git
-set COMMIT_SHA=e2024b0db796f42c3c7b20d55836d375aacf17a3
+set COMMIT_SHA=7f324c787ab4e52555fad04b6b1e3affa8369f32
 set BRANCH=main
 set DIRTY=0
 
